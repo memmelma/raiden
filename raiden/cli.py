@@ -232,6 +232,9 @@ class ConvertCommand:
     tri_stereo_variant: Literal["c32", "c64"] = "c64"
     """TRI Stereo model variant: 'c32' (faster) or 'c64' (higher quality). Only used when stereo_method=tri_stereo"""
 
+    no_depth: bool = True
+    """Skip depth map extraction entirely (default: True). Pass --no-depth false to compute depth."""
+
     reconvert: bool = False
     """Re-convert all successful demonstrations even if already marked as converted (default: False)"""
 
@@ -646,6 +649,7 @@ def main():
                     reconvert=command.reconvert,
                     processed_base=str(_Path(command.data_dir) / "processed"),
                     tri_stereo_variant=command.tri_stereo_variant,
+                    no_depth=command.no_depth,
                 )
 
         elif subcommand == "visualize":

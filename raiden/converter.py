@@ -128,6 +128,7 @@ def _extract_svo2_synchronized(
     ffs_scale: float = 1.0,
     ffs_iters: int = 8,
     tri_stereo_variant: str = "c64",
+    no_depth: bool = True,
 ) -> Dict[str, Tuple[np.ndarray, Optional[dict]]]:
     """Extract frames from multiple SVO2 files with cross-camera temporal alignment.
 
@@ -146,16 +147,24 @@ def _extract_svo2_synchronized(
     """
     from raiden.cameras.zed import ZedCamera
 
-    for d in rgb_dirs + depth_dirs:
+    dirs_to_create = rgb_dirs + ([] if no_depth else depth_dirs)
+    for d in dirs_to_create:
         d.mkdir(parents=True, exist_ok=True)
 
     use_ffs = stereo_method == "ffs"
     use_tri_stereo = stereo_method == "tri_stereo"
     use_learned_stereo = use_ffs or use_tri_stereo
 
+    if no_depth and use_learned_stereo:
+        print(
+            "  Warning: --no-depth is set; depth will not be computed "
+            f"(ignoring stereo_method={stereo_method!r})"
+        )
+        use_learned_stereo = False
+
     # Lazily create a shared depth predictor (one instance, GPU-loaded once).
     depth_predictor = None
-    if use_ffs:
+    if not no_depth and use_ffs:
         from raiden.depth.ffs import (
             FFSDepthPredictor,
             FFSOnnxDepthPredictor,
@@ -168,7 +177,7 @@ def _extract_svo2_synchronized(
             depth_predictor = FFSOnnxDepthPredictor()
         else:
             depth_predictor = FFSDepthPredictor(scale=ffs_scale, iters=ffs_iters)
-    elif use_tri_stereo:
+    elif not no_depth and use_tri_stereo:
         from raiden.depth.tri_stereo import (  # noqa: PLC0415
             TRIStereoOnnxDepthPredictor,
             TRIStereoTrtDepthPredictor,
@@ -195,7 +204,7 @@ def _extract_svo2_synchronized(
     # Open all cameras.
     cams: Dict[str, ZedCamera] = {
         name: ZedCamera.from_svo(
-            name, svo_path, compute_sdk_depth=not use_learned_stereo
+            name, svo_path, compute_sdk_depth=not use_learned_stereo and not no_depth
         )
         for name, svo_path in zip(names, svo_paths)
     }
@@ -268,30 +277,31 @@ def _extract_svo2_synchronized(
             color = cv2.rotate(frame.color, cv2.ROTATE_180) if flip else frame.color
             cv2.imwrite(str(rgb_dir_map[name] / f"{frame_idx:010d}{_IMG_EXT}"), color)
 
-            if use_learned_stereo:
-                fx, baseline = stereo_calib[name]
-                # Run inference on raw (pre-rotation) images — the ZED rectifies
-                # them in the sensor frame; rotating before inference only adds noise.
-                depth_m = depth_predictor.predict(
-                    frame.color, cam.get_right_color(), fx, baseline
+            if not no_depth:
+                if use_learned_stereo:
+                    fx, baseline = stereo_calib[name]
+                    # Run inference on raw (pre-rotation) images — the ZED rectifies
+                    # them in the sensor frame; rotating before inference only adds noise.
+                    depth_m = depth_predictor.predict(
+                        frame.color, cam.get_right_color(), fx, baseline
+                    )
+                    if flip:
+                        depth_m = cv2.rotate(depth_m, cv2.ROTATE_180)
+                    depth_mm = (depth_m * 1000.0).clip(0, 65535).astype(np.uint16)
+                else:
+                    depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
+                    if flip:
+                        depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
+                np.savez_compressed(
+                    str(depth_dir_map[name] / f"{frame_idx:010d}.npz"), depth=depth_mm
                 )
-                if flip:
-                    depth_m = cv2.rotate(depth_m, cv2.ROTATE_180)
-                depth_mm = (depth_m * 1000.0).clip(0, 65535).astype(np.uint16)
-            else:
-                depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
-                if flip:
-                    depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
-            np.savez_compressed(
-                str(depth_dir_map[name] / f"{frame_idx:010d}.npz"), depth=depth_mm
-            )
 
             timestamps[name].append(frame.timestamp_ns)
 
         frame_idx += 1
         pbar.update(1)
 
-        if use_learned_stereo and frame_idx % 10 == 0 and depth_predictor._n_calls > 0:
+        if not no_depth and use_learned_stereo and frame_idx % 10 == 0 and depth_predictor._n_calls > 0:
             avg_inf = depth_predictor._t_inference / depth_predictor._n_calls * 1000
             pbar.set_postfix(inf_ms=f"{avg_inf:.0f}", refresh=False)
 
@@ -300,7 +310,7 @@ def _extract_svo2_synchronized(
 
     pbar.close()
     print(f"    {frame_idx} synchronized frames extracted")
-    if use_learned_stereo and depth_predictor._n_calls > 0:
+    if not no_depth and use_learned_stereo and depth_predictor._n_calls > 0:
         label = "FFS" if use_ffs else f"TRIStereo-{tri_stereo_variant.upper()}"
         print(f"  {label} timing: {depth_predictor.timing_summary()}")
 
@@ -328,6 +338,7 @@ def _extract_bag(
     depth_dir: Path,
     flip: bool = False,
     max_frames: Optional[int] = None,
+    no_depth: bool = True,
 ) -> Tuple[np.ndarray, Optional[dict]]:
     """Extract color and depth frames from a RealSense .bag file.
 
@@ -343,7 +354,8 @@ def _extract_bag(
         return np.array([], dtype=np.int64), None
 
     rgb_dir.mkdir(parents=True, exist_ok=True)
-    depth_dir.mkdir(parents=True, exist_ok=True)
+    if not no_depth:
+        depth_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"  Opening {bag_path.name} ...")
     camera = RealSenseCamera.from_bag(bag_path.stem, bag_path)
@@ -359,10 +371,11 @@ def _extract_bag(
         color = cv2.rotate(frame.color, cv2.ROTATE_180) if flip else frame.color
         cv2.imwrite(str(rgb_dir / f"{idx:010d}{_IMG_EXT}"), color)
 
-        depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
-        if flip:
-            depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
-        np.savez_compressed(str(depth_dir / f"{idx:010d}.npz"), depth=depth_mm)
+        if not no_depth:
+            depth_mm = (frame.depth * 1000.0).clip(0, 65535).astype(np.uint16)
+            if flip:
+                depth_mm = cv2.rotate(depth_mm, cv2.ROTATE_180)
+            np.savez_compressed(str(depth_dir / f"{idx:010d}.npz"), depth=depth_mm)
 
         timestamps.append(frame.timestamp_ns)
         idx += 1
@@ -957,6 +970,7 @@ def convert_recording(
     ffs_iters: int = 8,
     tri_stereo_variant: str = "c64",
     reconvert: bool = False,
+    no_depth: bool = True,
 ) -> Dict[str, int]:
     """Convert a recording directory to UnifiedDataset format.
 
@@ -1090,6 +1104,7 @@ def convert_recording(
             ffs_scale=ffs_scale,
             ffs_iters=ffs_iters,
             tri_stereo_variant=tri_stereo_variant,
+            no_depth=no_depth,
         )
         for name, (ts_arr, info) in sync_results.items():
             frame_counts[name] = len(ts_arr)
@@ -1124,7 +1139,7 @@ def convert_recording(
         flip = name in _FLIP_CAMERAS
         print(f"  Extracting {bag_path.name}" + (" (flipped)" if flip else ""))
         ts_arr, info = _extract_bag(
-            bag_path, rgb_dir, depth_dir, flip=flip, max_frames=bag_max
+            bag_path, rgb_dir, depth_dir, flip=flip, max_frames=bag_max, no_depth=no_depth
         )
         frame_counts[name] = len(ts_arr)
         camera_infos[name] = info
@@ -1239,6 +1254,7 @@ def convert_task(
     reconvert: bool = False,
     processed_base: Optional[str] = None,
     tri_stereo_variant: str = "c64",
+    no_depth: bool = True,
 ) -> None:
     """Convert all recordings in a task directory into a single UnifiedDataset.
 
@@ -1335,6 +1351,7 @@ def convert_task(
             ffs_iters=ffs_iters,
             tri_stereo_variant=tri_stereo_variant,
             reconvert=reconvert,
+            no_depth=no_depth,
         )
 
         if counts:
