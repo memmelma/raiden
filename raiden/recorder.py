@@ -761,6 +761,9 @@ def run_recording(
     recorder: Optional[DemonstrationRecorder] = None
     robot_controller: Optional[RobotController] = None
 
+    success_count = 0
+    failure_count = 0
+
     use_right = arms == "bimanual"
     use_left = True
 
@@ -792,10 +795,12 @@ def run_recording(
             time.sleep(0.1)
 
             # ── wait to start ────────────────────────────────────────────
+            total = success_count + failure_count
             print("\n" + "=" * 60)
             print("  READY")
             print("=" * 60)
             print(f"\n  Data dir   : {task_dir}")
+            print(f"  Demos      : {total} total  ({success_count} success / {failure_count} failure)")
             if interface.waits_for_button_start:
                 print("\n  Press button on any leader arm or left pedal to START.")
             else:
@@ -892,7 +897,10 @@ def run_recording(
                         calibration_result_id=calibration_result_id,
                     )
                     db.update_demonstration(demo_id, status="failure", converted=False)
-                print("\nRecording aborted — marked as failure.\n")
+                failure_count += 1
+                total = success_count + failure_count
+                print("\nRecording aborted — marked as failure.")
+                print(f"  Session tally: {total} total  ({success_count} success / {failure_count} failure)\n")
                 break
 
             last_saved_dir = saved_dir
@@ -911,7 +919,14 @@ def run_recording(
                 if verdict:
                     print(f"  Demonstration marked as: {verdict}")
 
-            print(f"✓ Recording saved to: {saved_dir}\n")
+            if verdict == "success":
+                success_count += 1
+            elif verdict == "failure":
+                failure_count += 1
+
+            total = success_count + failure_count
+            print(f"✓ Recording saved to: {saved_dir}")
+            print(f"  Session tally: {total} total  ({success_count} success / {failure_count} failure)\n")
             # Loop back — cameras stay open, robots reinited next iteration.
 
     except KeyboardInterrupt:
