@@ -42,7 +42,7 @@ import concurrent.futures
 import json
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -231,6 +231,7 @@ class RaidenPolicyServer(chiral.PolicyServer):
         no_depth: bool = False,
         resize_images_size: Optional[Tuple[int, int]] = None,
         visualize: bool = False,
+        record_raw_images: bool = False,
     ):
         self._no_depth = no_depth
         self._resize = resize_images_size  # (H, W) or None
@@ -334,6 +335,11 @@ class RaidenPolicyServer(chiral.PolicyServer):
         self._cam_ts_locks: dict[str, threading.Lock] = {
             name: threading.Lock() for name in self._cam_handles
         }
+        # Frame buffers populated by camera threads when _video_recording is True.
+        self._record_raw_images = record_raw_images
+        self._video_recording: bool = False
+        self._video_frame_buffers: dict[str, list] = defaultdict(list)
+        self._video_buffers_lock = threading.Lock()
         self._cam_phase_offset_ns: dict[str, int] = {
             name: 0 for name in self._cam_handles
         }
@@ -1290,6 +1296,9 @@ class RaidenPolicyServer(chiral.PolicyServer):
                         color_bgr = cv2.rotate(color_bgr, cv2.ROTATE_180)
 
                 # Resize and serve RGB to the policy.
+                if self._record_raw_images and self._video_recording:
+                    with self._video_buffers_lock:
+                        self._video_frame_buffers[name].append(color_bgr)
                 if self._resize is not None:
                     h_out, w_out = self._resize
                     color_bgr = cv2.resize(
@@ -1323,6 +1332,9 @@ class RaidenPolicyServer(chiral.PolicyServer):
                 if flip:
                     color_bgr = cv2.rotate(color_bgr, cv2.ROTATE_180)
                     depth = cv2.rotate(depth, cv2.ROTATE_180)
+                if self._record_raw_images and self._video_recording:
+                    with self._video_buffers_lock:
+                        self._video_frame_buffers[name].append(color_bgr)
                 if self._resize is not None:
                     h_out, w_out = self._resize
                     color_bgr = cv2.resize(

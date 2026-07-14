@@ -32,6 +32,33 @@ from raiden._xml_paths import get_yam_4310_linear_xml_path
 from raiden.robot.controller import RobotController, smooth_move_joints
 
 
+def _noop_keep_mask(
+    joints: np.ndarray,
+    eps_joint: float,
+    eps_gripper: float,
+) -> np.ndarray:
+    """Return bool mask (N,) where True = keep this frame.
+
+    Frame *i* is a no-op if the delta to frame *i+1* is below threshold for
+    every channel.  The last frame is always kept so the trajectory end-pose is
+    preserved.
+
+    Args:
+        joints: ``(N, 7)`` (single arm) or ``(N, 14)`` (bimanual) joint array.
+        eps_joint: Max absolute delta (radians) for arm joints to count as a no-op.
+        eps_gripper: Max absolute delta for the gripper channel to count as a no-op.
+    """
+    d = np.abs(np.diff(joints.astype(np.float64), axis=0))  # (N-1, D)
+    dj_l = np.max(d[:, 0:6], axis=1)
+    dg_l = d[:, 6]
+    is_noop = (dj_l <= eps_joint) & (dg_l <= eps_gripper)
+    if joints.shape[1] >= 14:
+        dj_r = np.max(d[:, 7:13], axis=1)
+        dg_r = d[:, 13]
+        is_noop = is_noop & (dj_r <= eps_joint) & (dg_r <= eps_gripper)
+    return np.concatenate([~is_noop, [True]])  # always keep last frame
+
+
 def _load_raw_joints(
     ep_dir: Path,
 ) -> tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
@@ -261,6 +288,10 @@ def run_replay(
     camera_hz: int = 30,
     stride: int = 1,
     visualize: bool = False,
+    filter_noop: bool = False,
+    noop_eps_joint: float = 1e-3,
+    noop_eps_gripper: float = 1e-3,
+    noop_min_frames: int = 10,
 ) -> None:
     """Replay a recorded episode.
 
@@ -279,6 +310,10 @@ def run_replay(
             processed source only).
         stride: Subsample every N-th frame to match the shardify stride
             (default 1 = native rate, 3 = 10 Hz from 30 Hz recordings).
+        filter_noop: Drop static (no-op) frames before replay.
+        noop_eps_joint: Max absolute joint delta (rad) to classify as a no-op.
+        noop_eps_gripper: Max absolute gripper delta to classify as a no-op.
+        noop_min_frames: Abort replay if fewer frames remain after filtering.
     """
     if (recording_dir / "robot_data.npz").exists():
         _run_raw_replay(
@@ -288,6 +323,10 @@ def run_replay(
             control_hz=control_hz,
             stride=stride,
             visualize=visualize,
+            filter_noop=filter_noop,
+            noop_eps_joint=noop_eps_joint,
+            noop_eps_gripper=noop_eps_gripper,
+            noop_min_frames=noop_min_frames,
         )
     elif (recording_dir / "lowdim").exists():
         _run_processed_replay(
@@ -298,6 +337,10 @@ def run_replay(
             camera_hz=camera_hz,
             stride=stride,
             visualize=visualize,
+            filter_noop=filter_noop,
+            noop_eps_joint=noop_eps_joint,
+            noop_eps_gripper=noop_eps_gripper,
+            noop_min_frames=noop_min_frames,
         )
     else:
         raise FileNotFoundError(
@@ -312,6 +355,10 @@ def _run_raw_replay(
     control_hz: int = 150,
     stride: int = 1,
     visualize: bool = False,
+    filter_noop: bool = False,
+    noop_eps_joint: float = 1e-3,
+    noop_eps_gripper: float = 1e-3,
+    noop_min_frames: int = 10,
 ) -> None:
     """Replay directly from raw joint commands in robot_data.npz (no IK)."""
     joints_l, joints_r, timestamps = _load_raw_joints(recording_dir)
@@ -321,6 +368,25 @@ def _run_raw_replay(
         joints_l = joints_l[::stride]
         joints_r = joints_r[::stride] if joints_r is not None else None
         timestamps = timestamps[::stride]
+
+    if filter_noop:
+        combined = (
+            np.concatenate([joints_l, joints_r], axis=1)
+            if use_right and joints_r is not None
+            else joints_l
+        )
+        keep = _noop_keep_mask(combined, noop_eps_joint, noop_eps_gripper)
+        n_before = len(joints_l)
+        joints_l = joints_l[keep]
+        joints_r = joints_r[keep] if (use_right and joints_r is not None) else joints_r
+        timestamps = timestamps[keep]
+        n_after = len(joints_l)
+        print(f"No-op filter: {n_before} → {n_after} frames ({n_before - n_after} dropped)")
+        if n_after < noop_min_frames:
+            raise RuntimeError(
+                f"Only {n_after} frames remain after no-op filtering "
+                f"(min={noop_min_frames}); aborting replay."
+            )
 
     traj_l = _resample_joints(joints_l, timestamps, control_hz)
     traj_r = _resample_joints(joints_r, timestamps, control_hz) if use_right else None
@@ -351,6 +417,10 @@ def _run_processed_replay(
     camera_hz: int = 30,
     stride: int = 1,
     visualize: bool = False,
+    filter_noop: bool = False,
+    noop_eps_joint: float = 1e-3,
+    noop_eps_gripper: float = 1e-3,
+    noop_min_frames: int = 10,
 ) -> None:
     """Replay from processed lowdim pkl files using IK from EE poses."""
     use_right = arms == "bimanual"
@@ -358,6 +428,30 @@ def _run_processed_replay(
     actions = _load_action_sequence(recording_dir)
     if stride > 1:
         actions = actions[::stride]
+
+    if filter_noop:
+        joint_seq = _load_joint_sequence(recording_dir)
+        if joint_seq is not None:
+            if stride > 1:
+                joint_seq = joint_seq[::stride]
+            keep = _noop_keep_mask(joint_seq, noop_eps_joint, noop_eps_gripper)
+            n_before = len(actions)
+            actions = actions[keep]
+            n_after = len(actions)
+            print(
+                f"No-op filter: {n_before} → {n_after} frames ({n_before - n_after} dropped)"
+            )
+            if n_after < noop_min_frames:
+                raise RuntimeError(
+                    f"Only {n_after} frames remain after no-op filtering "
+                    f"(min={noop_min_frames}); aborting replay."
+                )
+        else:
+            print(
+                "No-op filter: skipped (no action_joints in lowdim; "
+                "filtering requires processed data with joint annotations)"
+            )
+
     effective_hz = camera_hz // stride
     n_keys = len(actions)
     duration_s = n_keys / effective_hz

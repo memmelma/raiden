@@ -103,6 +103,43 @@ class ResetCanCommand:
 
 
 @dataclass
+class RecalibrateCommand:
+    """Recalibrate DM motor firmware zero position(s) on a YAM arm.
+
+    This is a hardware calibration change (not easily undone). See
+    CALIBRATE.md for the full diagnosis/repair writeup.
+    """
+
+    channel: str
+    """CAN channel or friendly arm name: right_follower, left_follower, right_leader, left_leader
+    (or a raw channel like can_follower_r)"""
+
+    joints: str = "1,2,3,4,5,6"
+    """Comma-separated motor ids to recalibrate, e.g. '2' or '1,4,5'. Default: all 6 arm joints."""
+
+    targets: Optional[str] = None
+    """Comma-separated target position(s) (rad), matching --joints 1:1, in each motor's CURRENT
+    raw frame to move to before saving zero. Default: no movement -- each joint is zeroed at its
+    current position (use this when the arm is already resting in a known-good pose)."""
+
+    motor_types: Optional[str] = None
+    """Comma-separated motor types matching --joints (e.g. 'DM4340,DM4310'), or a single value
+    applied to all joints. Default: standard YAM mapping (joints 1-3 DM4340, joints 4-6 DM4310)."""
+
+    ramp_time: float = 2.5
+    """Seconds to smoothly ramp to target"""
+
+    settle_time: float = 1.0
+    """Seconds to hold at target before saving zero"""
+
+    dry_run: bool = False
+    """Connect, print current position(s) and planned ramp(s), but do NOT move or save zero"""
+
+    yes: bool = False
+    """Skip the interactive confirmation prompt (for scripting)"""
+
+
+@dataclass
 class MakeFfsOnnxCommand:
     """Export Fast Foundation Stereo model to ONNX (and optionally TensorRT engines)"""
 
@@ -261,6 +298,18 @@ class ReplayCommand:
     source: Literal["raw", "processed"] = "raw"
     """Data source: 'raw' loads joint commands directly from robot_data.npz (no IK); 'processed' loads EE poses from lowdim pkls and solves IK"""
 
+    filter_noop: bool = False
+    """Drop static no-op frames (where joints barely move) before replaying"""
+
+    noop_eps_joint: float = 1e-3
+    """Max absolute joint delta (radians) to classify a frame as a no-op"""
+
+    noop_eps_gripper: float = 1e-3
+    """Max absolute gripper delta to classify a frame as a no-op"""
+
+    noop_min_frames: int = 10
+    """Abort replay if fewer than this many frames remain after no-op filtering"""
+
 
 @dataclass
 class VisualizeCommand:
@@ -369,6 +418,9 @@ class InferCommand:
     action_hz: float = 30.0
     """Control loop frequency in Hz (default: 30, matches training data rate)."""
 
+    horizon: Optional[int] = None
+    """Number of control steps to run before stopping. Omit for unlimited (Ctrl+C to stop)."""
+
     camera_config_file: str = ""
     """Path to camera.json (default: ~/.config/raiden/camera.json)."""
 
@@ -402,6 +454,11 @@ class InferCommand:
 
     visualize: bool = False
     """Stream camera images to a Rerun web viewer at 30 FPS."""
+
+    save_video: str = ""
+    """Root directory for rollout video saving. When set, RGB frames from each
+    camera are written to save_video/<timestamp>/<camera_name>.mp4 at the end of
+    the rollout. Requires opencv-python."""
 
     bridge_kwargs: tuple[str, ...] = ()
     """Extra key=value pairs forwarded to bridge.load()
@@ -483,6 +540,9 @@ def _print_help() -> None:
     )
     print("  console                     Open the interactive metadata console (TUI)")
     print("  reset_can                   Reset CAN interfaces (bring down then up)")
+    print(
+        "  recalibrate                 Recalibrate motor firmware zero position(s) on a YAM arm"
+    )
     print(
         "  serve                       Start the chiral policy server for live inference"
     )
@@ -570,6 +630,10 @@ def main():
                 speed=command.speed,
                 stride=command.stride,
                 visualize=command.visualize,
+                filter_noop=command.filter_noop,
+                noop_eps_joint=command.noop_eps_joint,
+                noop_eps_gripper=command.noop_eps_gripper,
+                noop_min_frames=command.noop_min_frames,
             )
 
         elif subcommand == "list_devices":
@@ -778,6 +842,36 @@ def main():
             else:
                 sys.exit(1)
 
+        elif subcommand == "recalibrate":
+            sys.argv.pop(1)
+            command = tyro.cli(
+                RecalibrateCommand,
+                description="Recalibrate DM motor firmware zero position(s) on a YAM arm",
+            )
+            from raiden.robot.recalibrate import resolve_channel, run_recalibrate
+
+            if not command.dry_run and not command.yes:
+                print(
+                    "\nWARNING: this permanently rewrites firmware zero on "
+                    f"{resolve_channel(command.channel)} joint(s) {command.joints}.\n"
+                    "This is a hardware calibration change and is not easily undone.\n"
+                    "See CALIBRATE.md for background."
+                )
+                confirm = input("Proceed? [y/N]: ").strip().lower()
+                if confirm != "y":
+                    print("Aborted.")
+                    sys.exit(0)
+
+            run_recalibrate(
+                channel=command.channel,
+                joints=command.joints,
+                targets=command.targets,
+                motor_types=command.motor_types,
+                ramp_time=command.ramp_time,
+                settle_time=command.settle_time,
+                dry_run=command.dry_run,
+            )
+
         elif subcommand == "serve":
             sys.argv.pop(1)
             command = tyro.cli(
@@ -839,6 +933,7 @@ def main():
                 bridge=bridge,
                 ckpt_path=command.ckpt_path,
                 action_hz=command.action_hz,
+                horizon=command.horizon,
                 bridge_kwargs=extra_kwargs,
                 camera_config_file=command.camera_config_file or CAMERA_CONFIG,
                 calibration_file=command.calibration_file or CALIBRATION_FILE,
@@ -851,6 +946,7 @@ def main():
                 no_depth=command.no_depth,
                 resize_images_size=resize,
                 visualize=command.visualize,
+                save_video=command.save_video or None,
             )
             loop.run()
 

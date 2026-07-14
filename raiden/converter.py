@@ -58,6 +58,99 @@ _SEQUENCE_NAME = "0000"
 _IMG_EXT = ".png"
 
 # Cameras whose images are physically mounted upside-down and need a 180° correction.
+# ── raw-data quality thresholds ───────────────────────────────────────────────
+# Robot state is recorded at ~100 Hz and interpolated down to the camera rate
+# (30 fps) during conversion.  A gap in robot timestamps longer than one camera
+# frame period (1/30 s ≈ 33 ms) means at least one output frame falls in a dead
+# zone; np.interp bridges it silently, producing a spurious action jump.
+_ROBOT_TS_GAP_WARN_NS: int = int(33.4e6)   # ≈ 1 camera frame at 30 fps
+_WALL_CLOCK_MIN_NS:    int = 1_577_836_800_000_000_000  # 2020-01-01
+
+
+def _check_raw_episode(
+    rec_path: "Path",
+    rec_meta: dict,
+    robot_data: "Optional[Dict[str, np.ndarray]]",
+) -> List[str]:
+    """Check raw-data quality and return a list of warning strings.
+
+    Each entry is a human-readable warning about an issue that will cause
+    frame/action misalignment after conversion.  An empty list means the
+    episode looks healthy.  The caller is responsible for printing and
+    aggregating the returned warnings.
+    """
+    warnings: List[str] = []
+
+    if robot_data is None:
+        return warnings
+
+    ts_raw = robot_data.get("timestamps")
+    if ts_raw is None or len(ts_raw) == 0:
+        warnings.append(
+            "robot_data has no timestamps — converter will fall back to "
+            "linspace interpolation"
+        )
+        return warnings
+
+    ts = ts_raw.astype(np.float64)
+    diffs = np.diff(ts)
+
+    # Non-monotonic / duplicate timestamps
+    non_mono = int(np.sum(diffs <= 0))
+    if non_mono:
+        warnings.append(
+            f"{non_mono} non-monotonic robot timestamp step(s) — "
+            "np.interp gives wrong values on non-sorted input"
+        )
+
+    # Gaps wider than one camera frame period
+    gap_mask = diffs > _ROBOT_TS_GAP_WARN_NS
+    n_gaps = int(gap_mask.sum())
+    if n_gaps:
+        max_gap_ms = float(diffs[gap_mask].max()) / 1e6
+        gap_positions = np.where(gap_mask)[0].tolist()
+        warnings.append(
+            f"{n_gaps} robot timestamp gap(s) > "
+            f"{_ROBOT_TS_GAP_WARN_NS / 1e6:.0f} ms "
+            f"(max {max_gap_ms:.1f} ms, at step(s) {gap_positions}) — "
+            "interpolated actions will jump across the gap"
+        )
+
+    # NaN / Inf in any floating-point robot array
+    for key in robot_data:
+        arr = robot_data[key]
+        if not np.issubdtype(arr.dtype, np.floating):
+            continue
+        bad = int(np.sum(~np.isfinite(arr)))
+        if bad:
+            warnings.append(
+                f"'{key}' contains {bad} NaN/Inf value(s) — "
+                "will corrupt interpolated lowdim"
+            )
+
+    # Wall-clock domain check
+    if int(ts_raw[0]) <= _WALL_CLOCK_MIN_NS:
+        warnings.append(
+            f"robot timestamps don't appear to be wall-clock ns "
+            f"(ts[0]={ts_raw[0]}) — converter will fall back to linspace "
+            "interpolation (less accurate frame/action alignment)"
+        )
+
+    # Camera-start / robot-start overlap
+    cam_start_ns: dict = rec_meta.get("camera_start_times_ns", {})
+    if cam_start_ns and int(ts_raw[0]) > _WALL_CLOCK_MIN_NS:
+        earliest_cam_ns = min(cam_start_ns.values())
+        lead_ms = (int(ts_raw[0]) - earliest_cam_ns) / 1e6
+        if lead_ms < 0:
+            warnings.append(
+                f"robot timestamps start {abs(lead_ms):.1f} ms before the "
+                "earliest camera start — unexpected clock mismatch"
+            )
+
+    return warnings
+
+
+
 _FLIP_CAMERAS = {"right_wrist_camera"}
 
 # Camera role → robot_data joint key.
@@ -971,8 +1064,13 @@ def convert_recording(
     tri_stereo_variant: str = "c64",
     reconvert: bool = False,
     no_depth: bool = True,
+    _quality_issues: Optional[List[str]] = None,
 ) -> Dict[str, int]:
     """Convert a recording directory to UnifiedDataset format.
+
+    *_quality_issues* is an optional list that, when provided, will be
+    extended with any raw-data quality warnings detected for this episode.
+    The warnings are also printed inline so they appear in the convert log.
 
     When *episode_dir* is provided the sequence data is written there instead
     of ``recording_dir/0000``, and dataset-level files (split_all.json,
@@ -1025,6 +1123,12 @@ def convert_recording(
     if robot_path.exists():
         npz = np.load(robot_path, allow_pickle=False)
         robot_data = {k: npz[k] for k in npz.files}
+
+    _ep_issues = _check_raw_episode(rec_path, rec_meta, robot_data)
+    for w in _ep_issues:
+        print(f"  [quality] WARNING: {w}")
+    if _quality_issues is not None:
+        _quality_issues.extend(_ep_issues)
 
     calib: Optional[dict] = None
     calib_path = rec_path / "calibration_results.json"
@@ -1339,10 +1443,14 @@ def convert_task(
 
     print(f"Converting {len(success_dirs)} successful recording(s)\n")
 
+    # episode name → list of quality warning strings
+    quality_report: Dict[str, List[str]] = {}
+
     for i, rec_dir in enumerate(success_dirs):
         episode_name = f"{i:04d}"
         ep_dir = out_base / episode_name
         print(f"[{i + 1}/{len(success_dirs)}] {rec_dir.name} → {episode_name}/")
+        ep_issues: List[str] = []
         counts = convert_recording(
             str(rec_dir),
             episode_dir=str(ep_dir),
@@ -1352,7 +1460,10 @@ def convert_task(
             tri_stereo_variant=tri_stereo_variant,
             reconvert=reconvert,
             no_depth=no_depth,
+            _quality_issues=ep_issues,
         )
+        if ep_issues:
+            quality_report[episode_name] = ep_issues
 
         if counts:
             episode_frame_counts[episode_name] = max(counts.values())
@@ -1402,5 +1513,26 @@ def convert_task(
     if first_calib.exists():
         shutil.copy(first_calib, out_base / "calibration_results.json")
         print("✓ calibration_results.json")
+
+    # ── quality summary ────────────────────────────────────────────────────
+    total_eps = len(success_dirs)
+    n_affected = len(quality_report)
+    print(f"\n{'━' * 60}")
+    if not quality_report:
+        print(f"  Quality check: all {total_eps} episode(s) clean ✓")
+    else:
+        print(
+            f"  Quality check: {n_affected}/{total_eps} episode(s) with warnings"
+        )
+        for ep_name, issues in sorted(quality_report.items()):
+            src = success_dirs[int(ep_name)].name
+            print(f"\n  {ep_name}  ({src})")
+            for w in issues:
+                print(f"    ⚠  {w}")
+        print(
+            f"\n  {n_affected} episode(s) may have frame/action misalignment."
+            " Consider re-recording or excluding them from training."
+        )
+    print(f"{'━' * 60}")
 
     print(f"\n✓ Task dataset ready: {out_base}")

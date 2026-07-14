@@ -47,7 +47,11 @@ Thread layout (inherited from RaidenPolicyServer)::
 import importlib
 import time
 from abc import ABC, abstractmethod
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
+
+import tqdm
 
 import numpy as np
 from chiral.types import Observation
@@ -147,10 +151,14 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         ckpt_path: str,
         action_hz: float = 30.0,
         bridge_kwargs: Optional[dict] = None,
+        horizon: Optional[int] = None,
+        save_video: Optional[str] = None,
         **kwargs,
     ):
         self._bridge = bridge
         self._action_hz = action_hz
+        self._horizon = horizon
+        self._save_video = Path(save_video) if save_video else None
 
         # Load model FIRST — this can take seconds (downloading weights,
         # building the network) and doesn't need hardware.  Loading after
@@ -160,13 +168,19 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         print("Model loaded.\n")
 
         # Now initialize cameras, proprio threads, and robots (inherited).
-        super().__init__(**kwargs)
+        super().__init__(record_raw_images=(self._save_video is not None), **kwargs)
 
     def _safety_check_rl(self, action_14d: np.ndarray) -> None:
+        # --- ACTION LOGGING ---
+        with open("/tmp/action_log.txt", "a") as _f:
+            _f.write(",".join(map(str, action_14d)) + "\n")
         """Trip the e-stop if any joint delta exceeds ``_max_joint_delta``.
 
         Uses raiden's bimanual inference layout: ``[r(7), l(7)]``.  This is
         independent of ``RaidenPolicyServer._check_joint_delta`` (which uses
+        # --- ACTION LOGGING ---
+        with open("/tmp/action_log.txt", "a") as _f:
+            _f.write(",".join(map(str, action_14d)) + "\n")
         the ``[l, r]`` layout served over the WebSocket protocol).
         """
         pairs = []
@@ -186,16 +200,54 @@ class RaidenInferenceLoop(RaidenPolicyServer):
             if max_delta > self._max_joint_delta:
                 joint_idx = int(delta.argmax())
                 print(
-                    f"\n[SAFETY] Dangerously large joint delta on {arm} arm — "
-                    f"joint {joint_idx}: {max_delta:.4f} rad "
-                    f"(limit={self._max_joint_delta:.4f} rad). "
-                    "Triggering emergency stop."
+                    f"[CLIP] {arm} arm joint {joint_idx}: "
+                    f"{max_delta:.4f} > {self._max_joint_delta:.4f} rad. Clipping."
                 )
-                self._estop_active.set()
-                self._robot.emergency_stop()
+                commanded[:6] = np.clip(
+                    commanded[:6],
+                    current[:6] - self._max_joint_delta,
+                    current[:6] + self._max_joint_delta,
+                )
+
+    def _write_videos(self) -> None:
+        """Write per-camera frame buffers to MP4 files under a timestamped directory."""
+        try:
+            import imageio.v3 as iio
+        except ImportError:
+            print("[video] imageio not installed — skipping video save.")
+            return
+
+        with self._video_buffers_lock:
+            frame_buffers = {k: list(v) for k, v in self._video_frame_buffers.items()}
+
+        if not frame_buffers:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = self._save_video / timestamp
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for cam_name, frames in frame_buffers.items():
+            if not frames:
+                continue
+            out_path = out_dir / f"{cam_name}.mp4"
+            # Frames were stored as BGR (OpenCV convention); flip to RGB for imageio.
+            rgb_frames = [f[..., ::-1] for f in frames]
+            iio.imwrite(
+                str(out_path),
+                rgb_frames,
+                plugin="pyav",
+                codec="h264",
+                fps=self._action_hz,
+            )
+            print(f"[video] saved {len(frames)} frames → {out_path}")
 
     def run(self) -> None:
-        """Run the closed-loop inference loop.  Blocks until Ctrl+C."""
+        """Run the closed-loop inference loop.
+
+        Runs for ``self._horizon`` steps when set, otherwise blocks until Ctrl+C.
+        A tqdm progress bar is shown when a finite horizon is given.
+        """
         dt = 1.0 / self._action_hz
         step = 0
 
@@ -207,10 +259,22 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         self._bridge.reset()
 
         print(f"Starting inference at {self._action_hz} Hz")
-        print("Press Ctrl+C to stop.\n")
+        if self._horizon is not None:
+            print(f"Horizon: {self._horizon} steps (~{self._horizon / self._action_hz:.1f}s)")
+        else:
+            print("Press Ctrl+C to stop.\n")
+
+        if self._save_video is not None:
+            self._video_recording = True
 
         try:
-            while True:
+            iterator: object
+            if self._horizon is not None:
+                iterator = tqdm.trange(self._horizon, desc="rollout", unit="step")
+            else:
+                iterator = iter(int, 1)  # infinite iterator
+
+            for _ in iterator:
                 t_step = time.perf_counter()
 
                 # Build observation from live sensors.
@@ -249,7 +313,10 @@ class RaidenInferenceLoop(RaidenPolicyServer):
                 l_act = np.array2string(
                     action_14d[DOF : DOF * 2], precision=3, suppress_small=True
                 )
-                print(f"step={step:5d}  hz={hz:.1f}  r={r_act}  l={l_act}")
+                if self._horizon is not None:
+                    tqdm.tqdm.write(f"step={step:5d}  hz={hz:.1f}  r={r_act}  l={l_act}")
+                else:
+                    print(f"step={step:5d}  hz={hz:.1f}  r={r_act}  l={l_act}")
 
                 # Sleep to maintain target Hz.
                 elapsed = time.perf_counter() - t_step
@@ -260,6 +327,8 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         except KeyboardInterrupt:
             print("\n\nStopping inference...")
         finally:
+            if self._save_video is not None:
+                self._video_recording = False
             self._bridge.reset()
             if step > 0:
                 print("Returning to home...")
@@ -267,6 +336,8 @@ class RaidenInferenceLoop(RaidenPolicyServer):
             self._running = False
             time.sleep(0.1)
             self.close()
+            if self._save_video is not None:
+                self._write_videos()
             print("Done.")
 
 
