@@ -1,0 +1,1 @@
+this directory contains consolidated claude conversations for fixing past bugs. keeping it here for claude to reference.

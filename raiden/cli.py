@@ -922,7 +922,7 @@ def main():
                     sys.exit(1)
                 extra_kwargs[key] = value
 
-            bridge = load_bridge(command.bridge)
+            bridge = load_bridge(command.bridge, **extra_kwargs)
 
             resize: tuple | None = None
             if command.resize_images:

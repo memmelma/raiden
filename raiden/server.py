@@ -1211,23 +1211,37 @@ class RaidenPolicyServer(chiral.PolicyServer):
         pipeline = rs.pipeline()
         cfg = rs.config()
         cfg.enable_device(serial)
-        cfg.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
-        cfg.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 30)
+        # Color and depth MUST share a resolution here: the D405 derives both
+        # from the same stereo imagers, so a mismatched pair (e.g. color 1280x720
+        # + depth 848x480) fails with "Couldn't resolve requests". The D435 has a
+        # separate RGB sensor and tolerates a mismatch, but 848x480 works on both.
+        cfg.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, 30)
+        # The policy only uses RGB. --no-depth streams color-only, which halves
+        # the per-camera USB bandwidth so three cameras fit where color+depth
+        # would over-run a shared/USB-2 link ("Couldn't resolve requests").
+        want_depth = not self._no_depth
+        if want_depth:
+            cfg.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 30)
         profile = pipeline.start(cfg)
 
         color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
         intr = color_stream.get_intrinsics()
-        depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+        depth_scale = (
+            profile.get_device().first_depth_sensor().get_depth_scale()
+            if want_depth
+            else 1.0
+        )
         K = np.array(
             [[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]],
             dtype=np.float64,
         )
-        align = rs.align(rs.stream.color)
+        align = rs.align(rs.stream.color) if want_depth else None
         return {
             "type": "realsense",
             "pipeline": pipeline,
             "align": align,
             "depth_scale": depth_scale,
+            "want_depth": want_depth,
             "h": intr.height,
             "w": intr.width,
             "intrinsics": K,
@@ -1312,6 +1326,9 @@ class RaidenPolicyServer(chiral.PolicyServer):
         pipeline = handle["pipeline"]
         align = handle["align"]
         depth_scale = handle["depth_scale"]
+        # Color-only when depth wasn't enabled (--no-depth): the depth stream is
+        # absent, so aligning to / requiring a depth frame would drop every frame.
+        want_depth = handle.get("want_depth", align is not None)
         while self._running:
             try:
                 frames = pipeline.wait_for_frames(timeout_ms=500)
@@ -1320,18 +1337,25 @@ class RaidenPolicyServer(chiral.PolicyServer):
                 # for proprio interpolation.  Processing latency (resize etc.) is
                 # excluded from the timestamp.
                 frame_ts_ns = time.time_ns()
-                aligned = align.process(frames)
-                color_frame = aligned.get_color_frame()
-                depth_frame = aligned.get_depth_frame()
-                if not color_frame or not depth_frame:
-                    continue
+                depth = None
+                if want_depth:
+                    aligned = align.process(frames)
+                    color_frame = aligned.get_color_frame()
+                    depth_frame = aligned.get_depth_frame()
+                    if not color_frame or not depth_frame:
+                        continue
+                    depth = (
+                        np.asanyarray(depth_frame.get_data()) * depth_scale
+                    ).astype(np.float32)
+                else:
+                    color_frame = frames.get_color_frame()
+                    if not color_frame:
+                        continue
                 color_bgr = np.asanyarray(color_frame.get_data())  # BGR uint8
-                depth = (np.asanyarray(depth_frame.get_data()) * depth_scale).astype(
-                    np.float32
-                )
                 if flip:
                     color_bgr = cv2.rotate(color_bgr, cv2.ROTATE_180)
-                    depth = cv2.rotate(depth, cv2.ROTATE_180)
+                    if depth is not None:
+                        depth = cv2.rotate(depth, cv2.ROTATE_180)
                 if self._record_raw_images and self._video_recording:
                     with self._video_buffers_lock:
                         self._video_frame_buffers[name].append(color_bgr)
@@ -1340,12 +1364,13 @@ class RaidenPolicyServer(chiral.PolicyServer):
                     color_bgr = cv2.resize(
                         color_bgr, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
                     )
-                    depth = cv2.resize(
-                        depth, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
-                    )
+                    if depth is not None:
+                        depth = cv2.resize(
+                            depth, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
+                        )
                 # Serve RGB to the policy.
                 self.update_image(name, color_bgr[..., ::-1].copy())
-                if name in self.depths:
+                if depth is not None and name in self.depths:
                     self.update_depth(name, depth)
                 with self._cam_ts_locks[name]:
                     self._cam_capture_ts_ns[name] = frame_ts_ns
