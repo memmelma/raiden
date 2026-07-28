@@ -45,14 +45,14 @@ import pickle
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import AbstractSet, Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from tqdm import tqdm
 
 from raiden._config import CAMERA_CONFIG
-from raiden.camera_config import CameraConfig
+from raiden.camera_config import CameraConfig, flip_cameras_for_type
 
 _SEQUENCE_NAME = "0000"
 _IMG_EXT = ".png"
@@ -151,7 +151,10 @@ def _check_raw_episode(
 
 
 
-_FLIP_CAMERAS = {"right_wrist_camera"}
+# Default rig type. Which cameras are physically mounted upside-down depends on
+# the rig, so the set is resolved per-conversion from the ``camera_type``
+# argument (``--camera_type`` on the CLI) via flip_cameras_for_type().
+DEFAULT_CAMERA_TYPE = "realsense"
 
 # Camera role → robot_data joint key.
 _ROLE_TO_JOINT_KEY: Dict[str, str] = {
@@ -640,7 +643,7 @@ def _build_lowdim(
     calib: Optional[dict],
     robot_data: Optional[Dict[str, np.ndarray]],
     rec_meta: dict,
-    flip_cameras: set,
+    flip_cameras: AbstractSet[str],
     right_base_to_left_base: Optional[np.ndarray],
     cam_timestamps: Dict[str, Optional[np.ndarray]],
     wrist_camera_joint_keys: Optional[Dict[str, str]] = None,
@@ -1058,6 +1061,7 @@ def select_tasks(data_dir: str = "data") -> List[str]:
 def convert_recording(
     recording_dir: str,
     episode_dir: Optional[str] = None,
+    camera_type: str = DEFAULT_CAMERA_TYPE,
     stereo_method: str = "zed",
     ffs_scale: float = 1.0,
     ffs_iters: int = 8,
@@ -1067,6 +1071,10 @@ def convert_recording(
     _quality_issues: Optional[List[str]] = None,
 ) -> Dict[str, int]:
     """Convert a recording directory to UnifiedDataset format.
+
+    *camera_type* (``"realsense"`` or ``"zed"``) selects which cameras are
+    treated as upside-down and given a 180° image/intrinsics/extrinsics
+    correction.  It must match the rig the recording was captured on.
 
     *_quality_issues* is an optional list that, when provided, will be
     extended with any raw-data quality warnings detected for this episode.
@@ -1079,6 +1087,7 @@ def convert_recording(
 
     Returns per-camera frame counts, or an empty dict if already converted.
     """
+    flip_cameras = flip_cameras_for_type(camera_type)
     rec_path = Path(recording_dir)
     if not rec_path.exists():
         print(f"Error: directory not found: {rec_path}")
@@ -1202,7 +1211,7 @@ def convert_recording(
             names=svo2_names,
             rgb_dirs=[seq_dir / "rgb" / n for n in svo2_names],
             depth_dirs=[seq_dir / "depth" / n for n in svo2_names],
-            flips=[n in _FLIP_CAMERAS for n in svo2_names],
+            flips=[n in flip_cameras for n in svo2_names],
             max_frames=max_frames_svo2,
             stereo_method=stereo_method,
             ffs_scale=ffs_scale,
@@ -1240,7 +1249,7 @@ def convert_recording(
                 cam_timestamps[name] = None
             continue
 
-        flip = name in _FLIP_CAMERAS
+        flip = name in flip_cameras
         print(f"  Extracting {bag_path.name}" + (" (flipped)" if flip else ""))
         ts_arr, info = _extract_bag(
             bag_path, rgb_dir, depth_dir, flip=flip, max_frames=bag_max, no_depth=no_depth
@@ -1312,7 +1321,7 @@ def convert_recording(
         calib=calib,
         robot_data=robot_data,
         rec_meta=rec_meta,
-        flip_cameras=_FLIP_CAMERAS,
+        flip_cameras=flip_cameras,
         right_base_to_left_base=T_left_base_from_right_base,
         cam_timestamps=cam_timestamps,
         wrist_camera_joint_keys=wrist_camera_joint_keys,
@@ -1352,6 +1361,7 @@ def convert_recording(
 def convert_task(
     task_dir: str,
     output_dir: Optional[str] = None,
+    camera_type: str = DEFAULT_CAMERA_TYPE,
     stereo_method: str = "zed",
     ffs_scale: float = 1.0,
     ffs_iters: int = 8,
@@ -1373,7 +1383,12 @@ def convert_task(
             calibration_results.json
 
     *output_dir* defaults to ``<task_parent>/processed_data``.
+
+    *camera_type* is forwarded to :func:`convert_recording` and selects the
+    upside-down camera set for the rig these recordings came from.
     """
+    # Validate once, up front, rather than failing partway through a batch.
+    flip_cameras_for_type(camera_type)
     task_path = Path(task_dir)
     if not task_path.exists():
         print(f"Error: directory not found: {task_path}")
@@ -1454,6 +1469,7 @@ def convert_task(
         counts = convert_recording(
             str(rec_dir),
             episode_dir=str(ep_dir),
+            camera_type=camera_type,
             stereo_method=stereo_method,
             ffs_scale=ffs_scale,
             ffs_iters=ffs_iters,

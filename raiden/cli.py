@@ -257,6 +257,9 @@ class ConvertCommand:
     data_dir: str = "data"
     """Root data directory (default: ./data); reads from <data_dir>/raw/, writes to <data_dir>/processed/"""
 
+    camera_type: Literal["realsense", "zed"] = "realsense"
+    """Rig the recordings were captured on (default: realsense). 'zed' rotates the upside-down-mounted right_wrist_camera 180° and corrects its intrinsics/extrinsics; 'realsense' applies no correction. Must match the rig, and must match --camera_type used at inference time."""
+
     stereo_method: Literal["zed", "ffs", "tri_stereo"] = "zed"
     """Depth estimation backend for ZED cameras: 'zed' uses the ZED SDK (NEURAL_LIGHT), 'ffs' uses Fast Foundation Stereo, 'tri_stereo' uses the TRI Stereo model"""
 
@@ -427,6 +430,9 @@ class InferCommand:
     calibration_file: str = ""
     """Path to calibration_results.json (default: ~/.config/raiden/calibration_results.json)."""
 
+    camera_type: Literal["realsense", "zed"] = "realsense"
+    """Rig currently mounted on the robot (default: realsense). 'zed' rotates the upside-down-mounted right_wrist_camera 180° and corrects its intrinsics/extrinsics; 'realsense' applies no correction. Must match the --camera_type the checkpoint's training data was converted with."""
+
     stereo_method: Literal["zed", "ffs", "tri_stereo"] = "zed"
     """Depth backend: 'zed' (SDK NEURAL_LIGHT), 'ffs' (Fast Foundation Stereo), or 'tri_stereo' (TRI Stereo)."""
 
@@ -460,6 +466,16 @@ class InferCommand:
     camera are written to save_video/<timestamp>/<camera_name>.mp4 at the end of
     the rollout. Requires opencv-python."""
 
+    log_actions: str = ""
+    """Write every commanded action to a CSV. Pass a file path, or a directory
+    to get log_actions/actions_<timestamp>.csv. Each row holds the 14 commanded
+    values (6 joints + gripper per arm) plus the pre-clip policy request."""
+
+    camera_fps_interval: float = 2.0
+    """Seconds between per-camera fps reports (default: 2.0). Rates are printed
+    throughout the run and, when --log_actions is set, written to a
+    camera_fps_<timestamp>.csv beside the action log."""
+
     bridge_kwargs: tuple[str, ...] = ()
     """Extra key=value pairs forwarded to bridge.load()
     (e.g. --bridge-kwargs host=localhost port=8000 prompt='pick up the box')."""
@@ -474,6 +490,9 @@ class ServeCommand:
 
     port: int = 8765
     """WebSocket port to listen on"""
+
+    camera_type: Literal["realsense", "zed"] = "realsense"
+    """Rig currently mounted on the robot (default: realsense). 'zed' rotates the upside-down-mounted right_wrist_camera 180° and corrects its intrinsics/extrinsics; 'realsense' applies no correction. Must match the --camera_type the policy's training data was converted with."""
 
     stereo_method: Literal["zed", "ffs", "tri_stereo"] = "zed"
     """Depth backend: 'zed' (SDK NEURAL_LIGHT), 'ffs' (Fast Foundation Stereo), or 'tri_stereo' (TRI Stereo)"""
@@ -707,6 +726,7 @@ def main():
             for task_dir in select_tasks(command.data_dir):
                 convert_task(
                     task_dir,
+                    camera_type=command.camera_type,
                     stereo_method=command.stereo_method,
                     ffs_scale=command.ffs_scale,
                     ffs_iters=command.ffs_iters,
@@ -889,6 +909,7 @@ def main():
                 calibration_file=command.calibration_file,
                 host=command.host,
                 port=command.port,
+                camera_type=command.camera_type,
                 stereo_method=command.stereo_method,
                 ffs_scale=command.ffs_scale,
                 ffs_iters=command.ffs_iters,
@@ -937,6 +958,7 @@ def main():
                 bridge_kwargs=extra_kwargs,
                 camera_config_file=command.camera_config_file or CAMERA_CONFIG,
                 calibration_file=command.calibration_file or CALIBRATION_FILE,
+                camera_type=command.camera_type,
                 stereo_method=command.stereo_method,
                 ffs_scale=command.ffs_scale,
                 ffs_iters=command.ffs_iters,
@@ -947,6 +969,8 @@ def main():
                 resize_images_size=resize,
                 visualize=command.visualize,
                 save_video=command.save_video or None,
+                log_actions=command.log_actions or None,
+                camera_fps_interval=command.camera_fps_interval,
             )
             loop.run()
 

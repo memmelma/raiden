@@ -39,6 +39,43 @@ if TYPE_CHECKING:
     from raiden.cameras.base import Camera
 
 
+# ---------------------------------------------------------------------------
+# Physical mounting orientation
+# ---------------------------------------------------------------------------
+
+# Accepted values for the ``--camera_type`` flag on ``rd infer``/``rd convert``/
+# ``rd serve``.
+CAMERA_TYPES = ("realsense", "zed")
+
+# Cameras that are physically mounted upside-down, per rig type.  The ZED Mini
+# on the right wrist has to be bolted on inverted (see docs/guide/hardware.md),
+# whereas the RealSense wrist mounts are right-side-up and need no correction.
+_UPSIDE_DOWN_BY_TYPE: Dict[str, frozenset] = {
+    "realsense": frozenset(),
+    "zed": frozenset({"right_wrist_camera"}),
+}
+
+
+def flip_cameras_for_type(camera_type: str) -> frozenset:
+    """Return the names of cameras needing a 180° correction for *camera_type*.
+
+    For each returned camera the image is rotated 180° and the intrinsics'
+    principal point plus ``T_cam→ee`` are corrected to match, so the frame that
+    reaches a policy (or a converted dataset) is right-side-up regardless of how
+    the hardware is mounted.
+
+    Raises:
+        ValueError: if *camera_type* is not one of :data:`CAMERA_TYPES`.
+    """
+    key = (camera_type or "").lower()
+    if key not in _UPSIDE_DOWN_BY_TYPE:
+        raise ValueError(
+            f"Unknown camera_type {camera_type!r}. "
+            f"Expected one of {list(CAMERA_TYPES)}."
+        )
+    return _UPSIDE_DOWN_BY_TYPE[key]
+
+
 def _parse_entry(entry: Any) -> tuple[str, Any]:
     """Return (camera_type, serial) from a config entry (old or new format)."""
     if isinstance(entry, int):

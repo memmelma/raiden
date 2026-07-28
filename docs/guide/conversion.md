@@ -37,6 +37,38 @@ rd convert --reconvert
 If a recording has no database entry (e.g. recorded before the DB was set up)
 its status is treated as unknown and it is included.
 
+## Camera mounting orientation
+
+Some rigs mount a wrist camera upside-down, so its frames need a 180° rotation
+to come out right-side-up. Which cameras those are depends on the hardware, and
+is selected with `--camera-type`:
+
+| Value | Cameras rotated 180° | Notes |
+| --- | --- | --- |
+| `realsense` (default) | *(none)* | RealSense wrist mounts are right-side-up |
+| `zed` | `right_wrist_camera` | The ZED Mini right-wrist mount is inverted (see [Hardware](hardware.md)) |
+
+```bash
+# RealSense rig (default — no correction applied)
+rd convert
+
+# ZED rig — rotate the inverted right wrist camera
+rd convert --camera-type zed
+```
+
+When the flag selects a camera, three corrections are applied together so they
+stay mutually consistent:
+
+1. the RGB (and depth) image is rotated 180°,
+2. the intrinsics' principal point is reflected to `(w-1-cx, h-1-cy)`, and
+3. `T_cam→ee` is right-multiplied by a 180° Z-axis rotation.
+
+!!! warning "Must match at inference time"
+    `rd infer` and `rd serve` take the same `--camera-type` flag. A checkpoint
+    trained on data converted with `--camera-type zed` must be rolled out with
+    `--camera-type zed`, otherwise that wrist view arrives upside-down relative
+    to training and the policy will appear to ignore or misuse it.
+
 ## Depth backends for ZED cameras
 
 ZED stereo cameras support three depth estimation backends, selected with
@@ -122,9 +154,10 @@ so every camera directory contains exactly the same number of frames.
 ## File formats
 
 **`rgb/<camera>/<frame:010d>.jpg`**
-: BGR JPEG at quality ≥ 90. For cameras physically mounted upside-down
-  (`right_wrist_camera`) the image is rotated 180° so the stored image is
-  always right-side-up.
+: BGR JPEG at quality ≥ 90. For cameras physically mounted upside-down the
+  image is rotated 180° so the stored image is always right-side-up. Which
+  cameras those are is selected by `--camera_type` (see
+  [Camera mounting orientation](#camera-mounting-orientation)).
 
 **`depth/<camera>/<frame:010d>.npz`**
 : Compressed NumPy archive with a single key `"depth"` holding a uint16
@@ -171,8 +204,9 @@ T_left_base→cam[i] = [T_left_base←right_base @] FK(q[i]) @ T_cam→ee
 - `FK(q[i])` - MuJoCo forward kinematics for the YAM arm evaluated at the
   follower joint positions interpolated to frame *i*'s timestamp.
 - `T_cam→ee` - hand-eye calibration result (camera-to-end-effector). The
-  calibration was performed with the raw (upside-down) camera image, so for
-  `right_wrist_camera` a 180° Z-axis rotation correction is folded in.
+  calibration is performed with the raw camera image, so for any camera that is
+  mounted upside-down a 180° Z-axis rotation correction is folded in (see
+  [Camera mounting orientation](#camera-mounting-orientation)).
 - `T_left_base←right_base` - applied only for `right_wrist_camera` to
   bring the result from right-arm base into the common left-arm base frame.
 
