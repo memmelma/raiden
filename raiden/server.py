@@ -31,10 +31,13 @@ convention used by the converter).
 
 Image orientation
 -----------------
-Cameras in ``_FLIP_CAMERAS`` (e.g. ``right_wrist_camera``) are physically
-mounted upside-down.  The capture loop rotates their images by 180° to match
-the right-side-up orientation used by the training dataset.  The principal
-point in the intrinsics and the ``T_cam→ee`` rotation are corrected accordingly.
+Which cameras are physically mounted upside-down depends on the rig: the ZED
+Mini right-wrist mount is inverted, the RealSense wrist mounts are not.  The set
+is selected by the ``camera_type`` argument (``--camera_type`` on the CLI) via
+:func:`raiden.camera_config.flip_cameras_for_type`.  For each such camera the
+capture loop rotates the image by 180° to match the right-side-up orientation
+used by the training dataset, and the principal point in the intrinsics plus the
+``T_cam→ee`` rotation are corrected accordingly.
 """
 
 import asyncio
@@ -52,6 +55,7 @@ import numpy as np
 from chiral.types import CameraInfo, Observation
 
 from raiden.camera_config import CameraConfig as RaidenCameraConfig
+from raiden.camera_config import flip_cameras_for_type
 from raiden.camera_health import CameraHealthMonitor, check_cameras_at_startup
 from raiden.image_utils import resize_with_pad, scale_intrinsics_for_resize_with_pad
 from raiden.robot.controller import RobotController
@@ -60,9 +64,10 @@ from raiden.robot.controller import RobotController
 # Constants
 # ---------------------------------------------------------------------------
 
-# Cameras mounted upside-down: images are rotated 180° and extrinsics/
-# intrinsics are corrected to match the right-side-up frame.
-_FLIP_CAMERAS = {"right_wrist_camera"}
+# Default rig type. Cameras mounted upside-down for the selected type have their
+# images rotated 180° and their extrinsics/intrinsics corrected to match the
+# right-side-up frame; see flip_cameras_for_type().
+DEFAULT_CAMERA_TYPE = "realsense"
 
 # Maps wrist camera name → which follower arm drives its extrinsics.
 _WRIST_CAMERA_ARM: dict[str, str] = {
@@ -216,6 +221,8 @@ class RaidenPolicyServer(chiral.PolicyServer):
             the calibration file supplies extrinsics and ``T_cam→ee``.
         host: WebSocket host to bind to.
         port: WebSocket port to listen on.
+        camera_type: Rig type (``"realsense"`` or ``"zed"``) selecting which
+            cameras are treated as upside-down and given a 180° correction.
     """
 
     def __init__(
@@ -224,6 +231,7 @@ class RaidenPolicyServer(chiral.PolicyServer):
         calibration_file: str = "./config/calibration_results.json",
         host: str = "0.0.0.0",
         port: int = 8765,
+        camera_type: str = DEFAULT_CAMERA_TYPE,
         stereo_method: str = "zed",
         ffs_scale: float = 1.0,
         ffs_iters: int = 8,
@@ -242,6 +250,15 @@ class RaidenPolicyServer(chiral.PolicyServer):
                 f"action_type must be 'joint' or 'ee_pose', got {action_type!r}"
             )
         self._action_type = action_type
+        # Resolve before _open_cameras(): _prepare_camera_transforms() and the
+        # capture loops both consult this set.
+        self._camera_type = (camera_type or DEFAULT_CAMERA_TYPE).lower()
+        self._flip_cameras = flip_cameras_for_type(self._camera_type)
+        if self._flip_cameras:
+            print(
+                f"[camera] type={self._camera_type}: rotating 180° → "
+                f"{sorted(self._flip_cameras)}"
+            )
         self._raiden_cam_cfg = RaidenCameraConfig(camera_config_file)
         self._calibration = self._load_calibration(calibration_file)
         self._stereo_method = stereo_method
@@ -337,6 +354,12 @@ class RaidenPolicyServer(chiral.PolicyServer):
         self._cam_ts_locks: dict[str, threading.Lock] = {
             name: threading.Lock() for name in self._cam_handles
         }
+        # Monotonic count of frames each camera thread has published, guarded by
+        # that camera's entry in ``_cam_ts_locks``. Sampling the deltas over a
+        # known interval gives per-camera capture rate -- the configured fps is
+        # only a request, and a camera starved by USB bandwidth or per-frame
+        # processing will silently deliver far fewer.
+        self._cam_frame_counts: dict[str, int] = {name: 0 for name in self._cam_handles}
         # Frame buffers populated by camera threads when _video_recording is True.
         self._record_raw_images = record_raw_images
         self._video_recording: bool = False
@@ -468,7 +491,7 @@ class RaidenPolicyServer(chiral.PolicyServer):
 
         for name in self._raiden_cam_cfg.list_camera_names():
             handle = self._cam_handles.get(name)
-            flip = name in _FLIP_CAMERAS
+            flip = name in self._flip_cameras
 
             # ── intrinsics (from SDK, already at serving resolution) ──────
             if handle is not None:
@@ -1113,6 +1136,18 @@ class RaidenPolicyServer(chiral.PolicyServer):
             cameras=cameras, proprios=proprios, timestamp=ref_ts_ns * 1e-9
         )
 
+    def read_camera_frame_counts(self) -> dict:
+        """Snapshot each camera's published-frame count.
+
+        Sample twice and divide the deltas by the wall time between samples to
+        get actual per-camera capture rate.
+        """
+        counts = {}
+        for name in self._cam_handles:
+            with self._cam_ts_locks[name]:
+                counts[name] = self._cam_frame_counts[name]
+        return counts
+
     def _read_proprio(self, name: str) -> Optional[np.ndarray]:
         """Return a snapshot of a proprio buffer, or None if not available."""
         if name not in self.proprios:
@@ -1283,7 +1318,7 @@ class RaidenPolicyServer(chiral.PolicyServer):
         handle = self._cam_handles.get(name)
         if handle is None:
             return
-        flip = name in _FLIP_CAMERAS
+        flip = name in self._flip_cameras
         if handle["type"] == "zed":
             self._zed_capture_loop(name, handle, flip)
         else:
@@ -1360,6 +1395,7 @@ class RaidenPolicyServer(chiral.PolicyServer):
                 self.update_image(name, color_bgr[..., ::-1].copy())
                 with self._cam_ts_locks[name]:
                     self._cam_capture_ts_ns[name] = frame_ts_ns
+                    self._cam_frame_counts[name] += 1
 
     def _realsense_capture_loop(self, name: str, handle: dict, flip: bool) -> None:
         pipeline = handle["pipeline"]
@@ -1397,7 +1433,15 @@ class RaidenPolicyServer(chiral.PolicyServer):
                         depth = cv2.rotate(depth, cv2.ROTATE_180)
                 if self._record_raw_images and self._video_recording:
                     with self._video_buffers_lock:
-                        self._video_frame_buffers[name].append(color_bgr)
+                        # get_data() returns a VIEW into pyrealsense2's recycled
+                        # frame pool -- appending it without copying stores an
+                        # alias, so every buffered "frame" resolves to whatever
+                        # the pool holds at readout time and the video freezes.
+                        # (The served image below copies, so this never affected
+                        # the policy -- recording only.) cv2.rotate above already
+                        # returns a fresh array, but copy unconditionally so the
+                        # invariant holds regardless of the flip path.
+                        self._video_frame_buffers[name].append(color_bgr.copy())
                 if self._resize is not None:
                     h_out, w_out = self._resize
                     # Letterbox (uniform scale + zero-pad), not a stretch —
@@ -1417,6 +1461,7 @@ class RaidenPolicyServer(chiral.PolicyServer):
                     self.update_depth(name, depth)
                 with self._cam_ts_locks[name]:
                     self._cam_capture_ts_ns[name] = frame_ts_ns
+                    self._cam_frame_counts[name] += 1
             except RuntimeError:
                 time.sleep(0.01)
 
@@ -1580,6 +1625,7 @@ def run_server(
     calibration_file: str = "",
     host: str = "0.0.0.0",
     port: int = 8765,
+    camera_type: str = DEFAULT_CAMERA_TYPE,
     stereo_method: str = "zed",
     ffs_scale: float = 1.0,
     ffs_iters: int = 8,
@@ -1598,6 +1644,7 @@ def run_server(
         calibration_file=calibration_file or CALIBRATION_FILE,
         host=host,
         port=port,
+        camera_type=camera_type,
         stereo_method=stereo_method,
         ffs_scale=ffs_scale,
         ffs_iters=ffs_iters,

@@ -82,6 +82,17 @@ def _detect_chunk_size(bridge: "ModelBridge") -> Optional[int]:
     return None
 
 
+def _fmt_arm(arm_7d: np.ndarray) -> str:
+    """Format one arm's command as ``j0..j5`` plus gripper, on a single line.
+
+    Every commanded number is shown -- no summarization or small-value
+    suppression -- so the printed stream is a complete record of what the
+    motors were told to do.
+    """
+    joints = " ".join(f"{v:7.3f}" for v in arm_7d[:6])
+    return f"=[{joints}] g={arm_7d[6]:5.3f}"
+
+
 # ---------------------------------------------------------------------------
 # Abstract bridge interface
 # ---------------------------------------------------------------------------
@@ -181,6 +192,8 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         save_video: Optional[str] = None,
         log_dir: Optional[str] = None,
         log_images: bool = False,
+        log_actions: Optional[str] = None,
+        camera_fps_interval: float = 2.0,
         **kwargs,
     ):
         self._bridge = bridge
@@ -194,6 +207,19 @@ class RaidenInferenceLoop(RaidenPolicyServer):
             extra_meta={"log_images_enabled": log_images},
             **logger_kwargs,
         )
+        self._log_actions = log_actions or None
+        self._action_log_fh = None
+        self._action_log_path: Optional[Path] = None
+        self._video_t0: float = 0.0
+        # Per-camera fps tracking (see _open_camera_fps_log).
+        self._cam_names: list = []
+        self._cam_last_counts: dict = {}
+        self._cam_last_t: float = 0.0
+        self._cam_totals_t0: float = 0.0
+        self._cam_totals_start: dict = {}
+        self._cam_log_fh = None
+        self._cam_log_path: Optional[Path] = None
+        self._cam_sample_s: float = float(camera_fps_interval)
 
         # Load model FIRST — this can take seconds (downloading weights,
         # building the network) and doesn't need hardware.  Loading after
@@ -205,13 +231,18 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         # Now initialize cameras, proprio threads, and robots (inherited).
         super().__init__(record_raw_images=(self._save_video is not None), **kwargs)
 
-    def _safety_check_rl(self, action_14d: np.ndarray) -> None:
-        """Trip the e-stop if any joint delta exceeds ``_max_joint_delta``.
+    def _safety_check_rl(self, action_14d: np.ndarray) -> np.ndarray:
+        """Clip any joint delta that exceeds ``_max_joint_delta``.
 
         Uses raiden's bimanual inference layout: ``[r(7), l(7)]``.  This is
         independent of ``RaidenPolicyServer._check_joint_delta`` (which uses
         the ``[l, r]`` layout served over the WebSocket protocol).
+
+        Clips ``action_14d`` in place (the per-arm slices are views) and returns
+        the pre-clip copy so callers can log what the policy actually asked for
+        alongside what was commanded.
         """
+        policy_action = action_14d.copy()
         pairs = []
         if self._robot.follower_r:
             q_r = self._read_proprio("follower_r_joint_pos")
@@ -238,8 +269,155 @@ class RaidenInferenceLoop(RaidenPolicyServer):
                     current[:6] + self._max_joint_delta,
                 )
 
+        return policy_action
+
+    def _open_action_log(self) -> None:
+        """Open the action CSV and write its header.
+
+        One row per control step, holding every value that was commanded plus
+        the pre-clip policy request, so a rollout can be reconstructed exactly.
+        Buffered and held open for the run -- reopening per step would add file
+        I/O to a 50 Hz control loop.
+        """
+        if self._log_actions is None:
+            return
+        path = Path(self._log_actions)
+        if path.is_dir():
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = path / f"actions_{stamp}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._action_log_path = path
+        self._action_log_fh = open(path, "w", buffering=1 << 16)
+        cols = ["step", "t_wall", "hz", "clipped"]
+        for side in ("r", "l"):
+            cols += [f"cmd_{side}_j{i}" for i in range(6)] + [f"cmd_{side}_grip"]
+        for side in ("r", "l"):
+            cols += [f"policy_{side}_j{i}" for i in range(6)] + [f"policy_{side}_grip"]
+        # Measured gripper position, read back from the follower at the same
+        # step. A grasp failure looks different depending on which of these
+        # moves: policy_*_grip flat = the policy never asked to close;
+        # obs_*_grip failing to track cmd_*_grip = it asked and the hardware
+        # did not get there (blocked, out of range, or too slow).
+        cols += ["obs_r_grip", "obs_l_grip", "err_r_grip", "err_l_grip"]
+        self._action_log_fh.write(",".join(cols) + "\n")
+        print(f"[actions] logging every action to {path}")
+
+    def _log_action(
+        self,
+        step: int,
+        hz: float,
+        commanded: np.ndarray,
+        policy_action: np.ndarray,
+    ) -> None:
+        if self._action_log_fh is None:
+            return
+        clipped = int(not np.allclose(commanded, policy_action))
+        row = [str(step), f"{time.time():.6f}", f"{hz:.3f}", str(clipped)]
+        row += [f"{v:.6f}" for v in commanded]
+        row += [f"{v:.6f}" for v in policy_action]
+        obs_r, obs_l = self._read_gripper_state()
+        row += [
+            "" if obs_r is None else f"{obs_r:.6f}",
+            "" if obs_l is None else f"{obs_l:.6f}",
+            "" if obs_r is None else f"{commanded[6] - obs_r:.6f}",
+            "" if obs_l is None else f"{commanded[DOF * 2 - 1] - obs_l:.6f}",
+        ]
+        self._action_log_fh.write(",".join(row) + "\n")
+
+    def _read_gripper_state(self) -> tuple:
+        """Measured (right, left) gripper positions, or ``None`` per arm.
+
+        Index 6 of each follower's joint vector is the gripper.
+        """
+        out = []
+        for name in ("follower_r_joint_pos", "follower_l_joint_pos"):
+            q = self._read_proprio(name)
+            out.append(None if q is None or len(q) <= 6 else float(q[6]))
+        return tuple(out)
+
+    def _close_action_log(self) -> None:
+        if self._action_log_fh is not None:
+            self._action_log_fh.close()
+            self._action_log_fh = None
+            print(f"[actions] wrote action log -> {self._action_log_path}")
+
+    def _open_camera_fps_log(self) -> None:
+        """Start per-camera fps tracking, and open its CSV if action logging is on.
+
+        The configured fps is only a request. A camera starved by USB bandwidth
+        or per-frame work (depth alignment, frame buffering) delivers fewer, and
+        the policy silently conditions on stale views. This measures what each
+        camera actually produced, throughout the run.
+        """
+        self._cam_names = sorted(self.read_camera_frame_counts().keys())
+        self._cam_last_counts = self.read_camera_frame_counts()
+        self._cam_last_t = time.perf_counter()
+        self._cam_totals_t0 = self._cam_last_t
+        self._cam_totals_start = dict(self._cam_last_counts)
+
+        if self._action_log_path is None:
+            return
+        path = self._action_log_path.with_name(
+            self._action_log_path.stem.replace("actions_", "camera_fps_") + ".csv"
+        )
+        self._cam_log_fh = open(path, "w", buffering=1 << 14)
+        self._cam_log_path = path
+        self._cam_log_fh.write(
+            ",".join(["t_wall", "elapsed_s", *(f"{c}_fps" for c in self._cam_names)]) + "\n"
+        )
+        print(f"[cams] logging per-camera fps to {path}")
+
+    def _sample_camera_fps(self) -> None:
+        """Compute per-camera fps since the last sample; print and log a row."""
+        now = time.perf_counter()
+        dt = now - self._cam_last_t
+        if dt < self._cam_sample_s:
+            return
+        counts = self.read_camera_frame_counts()
+        fps = {
+            name: (counts[name] - self._cam_last_counts.get(name, 0)) / dt
+            for name in self._cam_names
+        }
+        self._cam_last_counts = counts
+        self._cam_last_t = now
+
+        parts = "  ".join(f"{n}={fps[n]:5.1f}" for n in self._cam_names)
+        line = f"[cams] {parts}"
+        if self._horizon is not None:
+            tqdm.tqdm.write(line)
+        else:
+            print(line)
+
+        if self._cam_log_fh is not None:
+            row = [f"{time.time():.6f}", f"{now - self._cam_totals_t0:.3f}"]
+            row += [f"{fps[n]:.3f}" for n in self._cam_names]
+            self._cam_log_fh.write(",".join(row) + "\n")
+
+    def _close_camera_fps_log(self) -> None:
+        """Print each camera's mean fps for the whole run, then close the CSV."""
+        if not getattr(self, "_cam_names", None):
+            return
+        elapsed = max(time.perf_counter() - self._cam_totals_t0, 1e-6)
+        counts = self.read_camera_frame_counts()
+        print("\n[cams] mean capture rate over the rollout:")
+        for name in self._cam_names:
+            n = counts[name] - self._cam_totals_start.get(name, 0)
+            mean = n / elapsed
+            flag = "" if mean >= 20.0 else "   <-- STARVED"
+            print(f"[cams]   {name:22s} {mean:5.1f} fps  ({n} frames){flag}")
+        if self._cam_log_fh is not None:
+            self._cam_log_fh.close()
+            self._cam_log_fh = None
+            print(f"[cams] wrote camera fps log -> {self._cam_log_path}")
+
     def _write_videos(self) -> None:
-        """Write per-camera frame buffers to MP4 files under a timestamped directory."""
+        """Write per-camera frame buffers to MP4 files under a timestamped directory.
+
+        Runs from the ``finally`` of :meth:`run`, at the end of a rollout whose
+        frames exist only in memory: a raised exception here destroys the whole
+        recording. So every failure is caught and reported per camera, and one
+        bad camera never costs the others.
+        """
         try:
             import imageio.v3 as iio
         except ImportError:
@@ -249,27 +427,47 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         with self._video_buffers_lock:
             frame_buffers = {k: list(v) for k, v in self._video_frame_buffers.items()}
 
+        frame_buffers = {k: v for k, v in frame_buffers.items() if v}
         if not frame_buffers:
+            print(
+                "[video] no frames were buffered — nothing to save. "
+                "(Cameras may have failed to start.)"
+            )
             return
+
+        # Frames are appended by the camera threads at each camera's own capture
+        # rate, which is NOT the control rate -- writing at action_hz would play
+        # the rollout back at the wrong speed. Derive fps from what was actually
+        # captured over the recording window.
+        elapsed = max(time.time() - self._video_t0, 1e-6)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = self._save_video / timestamp
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for cam_name, frames in frame_buffers.items():
-            if not frames:
-                continue
             out_path = out_dir / f"{cam_name}.mp4"
-            # Frames were stored as BGR (OpenCV convention); flip to RGB for imageio.
-            rgb_frames = [f[..., ::-1] for f in frames]
-            iio.imwrite(
-                str(out_path),
-                rgb_frames,
-                plugin="pyav",
-                codec="h264",
-                fps=self._action_hz,
-            )
-            print(f"[video] saved {len(frames)} frames → {out_path}")
+            fps = max(len(frames) / elapsed, 1.0)
+            try:
+                # Frames were stored as BGR (OpenCV convention); flip to RGB.
+                rgb_frames = [f[..., ::-1] for f in frames]
+                iio.imwrite(
+                    str(out_path),
+                    rgb_frames,
+                    plugin="pyav",
+                    codec="h264",
+                    fps=fps,
+                )
+                print(
+                    f"[video] saved {len(frames)} frames @ {fps:.1f} fps → {out_path}"
+                )
+            except ImportError as e:
+                print(
+                    f"[video] cannot encode {cam_name}: {e}\n"
+                    f"[video] install the encoder with:  uv pip install av"
+                )
+            except Exception as e:
+                print(f"[video] failed to write {out_path}: {type(e).__name__}: {e}")
 
     def run(self) -> None:
         """Run the closed-loop inference loop.
@@ -299,6 +497,9 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         # bridges from other repos).
         predict_latencies: "deque[float]" = deque(maxlen=50)
 
+        self._open_action_log()
+        self._open_camera_fps_log()
+
         print(f"Starting inference at {self._action_hz} Hz")
         if self._horizon is not None:
             print(f"Horizon: {self._horizon} steps (~{self._horizon / self._action_hz:.1f}s)")
@@ -306,6 +507,7 @@ class RaidenInferenceLoop(RaidenPolicyServer):
             print("Press Ctrl+C to stop.\n")
 
         if self._save_video is not None:
+            self._video_t0 = time.time()
             self._video_recording = True
 
         try:
@@ -337,11 +539,12 @@ class RaidenInferenceLoop(RaidenPolicyServer):
                 else:
                     action_14d = action
 
-                # Snapshot the predicted action before safety clipping mutates it.
-                action_pred_14d = action_14d.copy()
-
-                # Safety check — abort if any joint jumps too far ([r, l]).
-                self._safety_check_rl(action_14d)
+                # Safety check — clip any joint that jumps too far ([r, l]).
+                # Returns the pre-clip request so the log can distinguish what
+                # the policy asked for from what the motors were given.
+                policy_action = self._safety_check_rl(action_14d)
+                # Same value under the name the RolloutLogger call below uses.
+                action_pred_14d = policy_action
 
                 self._last_joint_cmd = action_14d
 
@@ -392,14 +595,31 @@ class RaidenInferenceLoop(RaidenPolicyServer):
 
                 elapsed = time.perf_counter() - t_step
                 hz = 1.0 / max(elapsed, 1e-6)
-                r_act = np.array2string(action_14d[:DOF], precision=3, suppress_small=True)
-                l_act = np.array2string(
-                    action_14d[DOF : DOF * 2], precision=3, suppress_small=True
+
+                self._log_action(step, hz, action_14d, policy_action)
+                self._sample_camera_fps()
+
+                # Print every commanded value: 6 arm joints + gripper per arm.
+                # ``_fmt_arm`` keeps a step on one line -- at 50 Hz, multi-line
+                # output makes stdout itself a source of control-loop jitter.
+                clip_flag = "" if np.allclose(action_14d, policy_action) else "  [CLIPPED]"
+                # Commanded gripper alone can't explain a failed grasp -- show
+                # what the fingers actually did next to what they were told.
+                obs_r_g, obs_l_g = self._read_gripper_state()
+                grip_obs = (
+                    f"  grip_obs R={'  n/a' if obs_r_g is None else f'{obs_r_g:5.3f}'}"
+                    f" L={'  n/a' if obs_l_g is None else f'{obs_l_g:5.3f}'}"
+                )
+                line = (
+                    f"step={step:5d} hz={hz:5.1f}"
+                    f"  R{_fmt_arm(action_14d[:DOF])}"
+                    f"  L{_fmt_arm(action_14d[DOF : DOF * 2])}"
+                    f"{grip_obs}{clip_flag}"
                 )
                 if self._horizon is not None:
-                    tqdm.tqdm.write(f"step={step:5d}  hz={hz:.1f}  r={r_act}  l={l_act}")
+                    tqdm.tqdm.write(line)
                 else:
-                    print(f"step={step:5d}  hz={hz:.1f}  r={r_act}  l={l_act}")
+                    print(line)
 
                 # Sleep to maintain target Hz.
                 elapsed = time.perf_counter() - t_step
@@ -422,6 +642,8 @@ class RaidenInferenceLoop(RaidenPolicyServer):
             self._rollout_logger.save()
             if self._save_video is not None:
                 self._video_recording = False
+            self._close_action_log()
+            self._close_camera_fps_log()
             self._bridge.reset()
             if step > 0:
                 print("Returning to home...")
