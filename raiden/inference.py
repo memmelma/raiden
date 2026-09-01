@@ -47,6 +47,7 @@ Thread layout (inherited from RaidenPolicyServer)::
 import importlib
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -56,9 +57,29 @@ import tqdm
 import numpy as np
 from chiral.types import Observation
 
+from raiden.robot.rollout_logger import RolloutLogger
 from raiden.server import RaidenPolicyServer
 
 DOF = 7  # joints per arm (6 revolute + 1 gripper)
+
+# Attribute names various bridges use for their fixed action-chunk length.
+# Checked in order; the first one present on the bridge instance wins.
+_CHUNK_SIZE_ATTRS = ("execute_len", "action_horizon", "_action_horizon", "chunk_size", "_chunk_size")
+
+
+def _detect_chunk_size(bridge: "ModelBridge") -> Optional[int]:
+    """Best-effort lookup of a bridge's fixed action-chunk length.
+
+    Different bridges name this differently (``OpenPiBridge.execute_len``,
+    a custom bridge's ``action_horizon``/``_action_horizon``, etc.) — try the
+    common spellings before falling back to latency-based detection in
+    :meth:`RaidenInferenceLoop.run`.
+    """
+    for attr in _CHUNK_SIZE_ATTRS:
+        val = getattr(bridge, attr, None)
+        if val:
+            return int(val)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +162,11 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         action_hz: Control loop frequency in Hz (default 30, should match
             training data frame rate).
         bridge_kwargs: Extra keyword arguments forwarded to ``bridge.load()``.
+        log_dir: Root directory for rollout debug logs (see ``RolloutLogger``).
+        log_images: Also save a camera snapshot at every detected action-chunk
+            boundary. Off by default — writing images to disk on the control
+            thread has previously caused control-loop slowdowns / jerky
+            motion, so only enable this when actively debugging.
         **kwargs: Forwarded to ``RaidenPolicyServer`` (camera_config_file,
             calibration_file, stereo_method, etc.).
     """
@@ -153,12 +179,21 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         bridge_kwargs: Optional[dict] = None,
         horizon: Optional[int] = None,
         save_video: Optional[str] = None,
+        log_dir: Optional[str] = None,
+        log_images: bool = False,
         **kwargs,
     ):
         self._bridge = bridge
         self._action_hz = action_hz
         self._horizon = horizon
         self._save_video = Path(save_video) if save_video else None
+        self._log_images = log_images
+        logger_kwargs = {"log_root": Path(log_dir)} if log_dir else {}
+        self._rollout_logger = RolloutLogger(
+            source="infer",
+            extra_meta={"log_images_enabled": log_images},
+            **logger_kwargs,
+        )
 
         # Load model FIRST — this can take seconds (downloading weights,
         # building the network) and doesn't need hardware.  Loading after
@@ -171,16 +206,10 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         super().__init__(record_raw_images=(self._save_video is not None), **kwargs)
 
     def _safety_check_rl(self, action_14d: np.ndarray) -> None:
-        # --- ACTION LOGGING ---
-        with open("/tmp/action_log.txt", "a") as _f:
-            _f.write(",".join(map(str, action_14d)) + "\n")
         """Trip the e-stop if any joint delta exceeds ``_max_joint_delta``.
 
         Uses raiden's bimanual inference layout: ``[r(7), l(7)]``.  This is
         independent of ``RaidenPolicyServer._check_joint_delta`` (which uses
-        # --- ACTION LOGGING ---
-        with open("/tmp/action_log.txt", "a") as _f:
-            _f.write(",".join(map(str, action_14d)) + "\n")
         the ``[l, r]`` layout served over the WebSocket protocol).
         """
         pairs = []
@@ -258,6 +287,18 @@ class RaidenInferenceLoop(RaidenPolicyServer):
 
         self._bridge.reset()
 
+        # Detect the bridge's action-chunk size (e.g. OpenPiBridge.execute_len,
+        # or a custom bridge's action_horizon) so logged rollouts can mark
+        # chunk boundaries even for bridges that don't expose a
+        # ``just_refilled`` flag.
+        chunk_size = _detect_chunk_size(self._bridge)
+        self._rollout_logger.chunk_size = chunk_size
+        # Rolling baseline of predict() latency, used as a bridge-agnostic
+        # fallback chunk-boundary detector (see below) for bridges that don't
+        # expose ``just_refilled`` or ``execute_len`` at all (e.g. custom
+        # bridges from other repos).
+        predict_latencies: "deque[float]" = deque(maxlen=50)
+
         print(f"Starting inference at {self._action_hz} Hz")
         if self._horizon is not None:
             print(f"Horizon: {self._horizon} steps (~{self._horizon / self._action_hz:.1f}s)")
@@ -281,7 +322,9 @@ class RaidenInferenceLoop(RaidenPolicyServer):
                 obs = self._make_obs()
 
                 # Ask bridge for next motor command (raiden layout: [r, l]).
+                t_predict = time.perf_counter()
                 action = self._bridge.predict(obs)
+                predict_elapsed = time.perf_counter() - t_predict
 
                 # Convert EE pose to joint command if needed.  Note: the
                 # parent's ``_ee_pose_to_joint_cmd`` returns ``[l, r]``; for
@@ -294,10 +337,50 @@ class RaidenInferenceLoop(RaidenPolicyServer):
                 else:
                     action_14d = action
 
+                # Snapshot the predicted action before safety clipping mutates it.
+                action_pred_14d = action_14d.copy()
+
                 # Safety check — abort if any joint jumps too far ([r, l]).
                 self._safety_check_rl(action_14d)
 
                 self._last_joint_cmd = action_14d
+
+                # Log policy observation, actual robot state, and predicted vs.
+                # commanded action for offline debugging (see rd infer's
+                # RolloutLogger / scripts/visualize_rollout.py).
+                q_r = obs.proprios.get("follower_r_joint_pos")
+                q_l = obs.proprios.get("follower_l_joint_pos")
+                if q_r is not None and q_l is not None:
+                    state_14d = np.concatenate([q_r, q_l])
+                    # Prefer the bridge's own signal for "just fetched a fresh
+                    # chunk" (e.g. OpenPiEEBridge.just_refilled) since it's
+                    # exact; fall back to step-modulo when the bridge exposes
+                    # a fixed chunk length (e.g. OpenPiBridge.execute_len).
+                    # For bridges that expose neither (custom/third-party
+                    # bridges), detect refills generically: querying the
+                    # policy for a fresh chunk is far slower than popping an
+                    # already-buffered action off a local queue, so a latency
+                    # spike relative to the rolling baseline is a reliable
+                    # signal regardless of bridge internals.
+                    if hasattr(self._bridge, "just_refilled"):
+                        chunk_start = bool(self._bridge.just_refilled)
+                    elif chunk_size:
+                        chunk_start = step % chunk_size == 0
+                    elif predict_latencies:
+                        baseline = float(np.median(predict_latencies))
+                        chunk_start = predict_elapsed > max(3.0 * baseline, 0.02)
+                    else:
+                        chunk_start = True  # first step always starts a chunk
+                    predict_latencies.append(predict_elapsed)
+                    self._rollout_logger.log_step(
+                        obs=obs,
+                        state_14d=state_14d,
+                        action_pred_14d=action_pred_14d,
+                        action_cmd_14d=action_14d,
+                        chunk_start=chunk_start,
+                    )
+                    if chunk_start and self._log_images:
+                        self._rollout_logger.log_chunk_images(step, obs.cameras)
 
                 # Command motors (raiden inference layout: right first, then left).
                 if self._robot.follower_r:
@@ -327,6 +410,16 @@ class RaidenInferenceLoop(RaidenPolicyServer):
         except KeyboardInterrupt:
             print("\n\nStopping inference...")
         finally:
+            unhealthy = self.get_unhealthy_cameras()
+            if unhealthy:
+                print(
+                    f"[camera-health] WARNING: camera(s) were unhealthy at some "
+                    f"point during this rollout: {unhealthy}. Treat this run's "
+                    "policy behavior as suspect — see rollout meta.json "
+                    "['unhealthy_cameras']."
+                )
+            self._rollout_logger.extra_meta["unhealthy_cameras"] = unhealthy
+            self._rollout_logger.save()
             if self._save_video is not None:
                 self._video_recording = False
             self._bridge.reset()

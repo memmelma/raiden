@@ -310,6 +310,23 @@ class ReplayCommand:
     noop_min_frames: int = 10
     """Abort replay if fewer than this many frames remain after no-op filtering"""
 
+    log_dir: str = ""
+    """Root directory for rollout debug logs (replayed trajectory vs. actual
+    robot state), same format as 'rd infer' — pass to
+    scripts/visualize_rollout.py to compare replay against inference.
+    Default: /home/reward/Projects/logs/"""
+
+    log_images: bool = False
+    """Also periodically log (1) a live snapshot from the real robot's
+    cameras and (2) the matching recorded frame from the dataset being
+    replayed, for visual comparison. Off by default (opens real cameras +
+    decodes the recording's video — has a cost, so opt in only when
+    actively debugging)."""
+
+    image_log_hz: float = 2.0
+    """How often to capture the live/dataset image pair, in Hz (only used
+    when --log_images is set). Independent of the control loop rate."""
+
 
 @dataclass
 class VisualizeCommand:
@@ -463,6 +480,18 @@ class InferCommand:
     bridge_kwargs: tuple[str, ...] = ()
     """Extra key=value pairs forwarded to bridge.load()
     (e.g. --bridge-kwargs host=localhost port=8000 prompt='pick up the box')."""
+
+    log_dir: str = ""
+    """Root directory for rollout debug logs (observations, robot states,
+    predicted actions). Each rollout gets its own timestamped subdirectory.
+    Default: /home/reward/Projects/logs/"""
+
+    log_images: bool = False
+    """Also save a camera snapshot at every detected action-chunk boundary
+    (for scripts/visualize_rollout.py's per-chunk image grid). Disabled by
+    default: writing images to disk on the control thread has previously
+    caused control-loop slowdowns / jerky motion. Enable only when actively
+    debugging."""
 
 
 @dataclass
@@ -634,6 +663,9 @@ def main():
                 noop_eps_joint=command.noop_eps_joint,
                 noop_eps_gripper=command.noop_eps_gripper,
                 noop_min_frames=command.noop_min_frames,
+                log_dir=command.log_dir or None,
+                log_images=command.log_images,
+                image_log_hz=command.image_log_hz,
             )
 
         elif subcommand == "list_devices":
@@ -947,6 +979,8 @@ def main():
                 resize_images_size=resize,
                 visualize=command.visualize,
                 save_video=command.save_video or None,
+                log_dir=command.log_dir or None,
+                log_images=command.log_images,
             )
             loop.run()
 

@@ -209,7 +209,7 @@ class RealSenseCamera(Camera):
 
     def grab(self) -> bool:
         try:
-            frames = self._pipeline.wait_for_frames(timeout_ms=500)
+            frames = self._pipeline.wait_for_frames(timeout_ms=2000)
             if not getattr(self, "_is_playback", False):
                 # Drain any additional buffered frames so we always use the most
                 # recent one. Bag-file writing overhead can cause the queue to

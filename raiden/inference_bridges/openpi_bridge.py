@@ -45,6 +45,7 @@ import cv2
 import msgpack
 import numpy as np
 
+from raiden.image_utils import resize_with_pad
 from raiden.inference import ModelBridge
 from raiden.intervention import (
     InterventionConfig,
@@ -547,7 +548,14 @@ class OpenPiBridge(ModelBridge):
 
     @staticmethod
     def _prep_image(img: np.ndarray) -> np.ndarray:
-        """Ensure HWC uint8 RGB at 224x224."""
+        """Ensure HWC uint8 RGB at 224x224.
+
+        Uses a letterbox resize (uniform scale + zero-pad), matching the
+        training-time ``resize_with_pad`` transform, instead of a plain
+        ``cv2.resize`` — a naive resize stretches non-square camera frames
+        (e.g. 480x640) to fill the square target, distorting geometry in a
+        way the policy never saw during training.
+        """
         if img.ndim == 3 and img.shape[0] == 3 and img.shape[-1] != 3:
             img = np.transpose(img, (1, 2, 0))
         if img.dtype != np.uint8:
@@ -557,7 +565,7 @@ class OpenPiBridge(ModelBridge):
                 img = img.astype(np.uint8)
         h, w = img.shape[:2]
         if (h, w) != (IMG_HW, IMG_HW):
-            img = cv2.resize(img, (IMG_HW, IMG_HW), interpolation=cv2.INTER_AREA)
+            img = resize_with_pad(img, IMG_HW, IMG_HW, interpolation=cv2.INTER_AREA)
         return np.ascontiguousarray(img)
 
     def __del__(self):

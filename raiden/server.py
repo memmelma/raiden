@@ -52,6 +52,8 @@ import numpy as np
 from chiral.types import CameraInfo, Observation
 
 from raiden.camera_config import CameraConfig as RaidenCameraConfig
+from raiden.camera_health import CameraHealthMonitor, check_cameras_at_startup
+from raiden.image_utils import resize_with_pad, scale_intrinsics_for_resize_with_pad
 from raiden.robot.controller import RobotController
 
 # ---------------------------------------------------------------------------
@@ -404,6 +406,19 @@ class RaidenPolicyServer(chiral.PolicyServer):
         print("\nComputing camera phase offsets...")
         self._compute_camera_offsets()
 
+        # Fail fast if any camera's first frame is black/degenerate — e.g. a
+        # RealSense stream that never actually delivered a frame (silently
+        # leaving self.images[name] at its zero-initialized default forever).
+        # Previously this only produced a soft warning in
+        # _wait_for_first_frames, which let a dead camera ride through an
+        # entire inference/recording session unnoticed.
+        print("Checking camera health...")
+        check_cameras_at_startup(
+            {name: self.images[name] for name in self._cam_handles},
+            context="RaidenPolicyServer startup",
+        )
+        self._camera_health = CameraHealthMonitor()
+
         # Attach footpedal hard e-stop (optional — warns and continues if absent).
         # Use a custom callback so _estop_active is set *before* emergency_stop()
         # runs, guaranteeing that any concurrent step() call sees the flag and
@@ -466,10 +481,11 @@ class RaidenPolicyServer(chiral.PolicyServer):
                 if self._resize is not None:
                     h_out, w_out = self._resize
                     h_src, w_src = handle["h"], handle["w"]
-                    K[0, 0] *= w_out / w_src  # fx
-                    K[0, 2] *= w_out / w_src  # cx
-                    K[1, 1] *= h_out / h_src  # fy
-                    K[1, 2] *= h_out / h_src  # cy
+                    # Matches the letterbox resize_with_pad() now applied in the
+                    # capture loops: uniform scale + principal-point offset for
+                    # the pad margins (NOT independent fx/fy scale factors,
+                    # which would only be correct for a non-uniform stretch).
+                    K = scale_intrinsics_for_resize_with_pad(K, h_src, w_src, h_out, w_out)
                 self._cam_intrinsics[name] = K
             else:
                 # Camera failed to open — use a placeholder.
@@ -989,6 +1005,12 @@ class RaidenPolicyServer(chiral.PolicyServer):
     # Observation construction (overrides base class to add dynamic extrinsics)
     # -------------------------------------------------------------------------
 
+    def get_unhealthy_cameras(self) -> list[str]:
+        """Names of cameras flagged black/frozen at any point this session by
+        the running :class:`~raiden.camera_health.CameraHealthMonitor`
+        (see ``_make_obs``). Empty when everything looked fine the whole run."""
+        return self._camera_health.ever_unhealthy_cameras()
+
     def _make_obs(self) -> Observation:
         """Snapshot all buffers and compute per-step wrist camera extrinsics.
 
@@ -1037,6 +1059,16 @@ class RaidenPolicyServer(chiral.PolicyServer):
                     timestamp=cam_ts,
                 )
             )
+
+            # Keep watching every camera for the rest of the session — catches
+            # a camera that goes black/frozen mid-run (e.g. USB dropout) even
+            # though it passed the startup check. Pass the capture timestamp so
+            # freeze detection keys off SDK time advancing (not mean brightness,
+            # which false-positives on visually stable scenes). Rate-limited
+            # internally, so this is safe to call every control step.
+            warning = self._camera_health.update(c.name, image, timestamp=cam_ts)
+            if warning:
+                print(warning)
 
         # EE pose proprio names are derived from FK — skip ring-buffer lookup for them.
         _ee_pose_keys = {
@@ -1300,8 +1332,11 @@ class RaidenPolicyServer(chiral.PolicyServer):
                         depth = cv2.rotate(depth, cv2.ROTATE_180)
                     if self._resize is not None:
                         h_out, w_out = self._resize
-                        depth = cv2.resize(
-                            depth, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
+                        # Letterbox, not stretch — keeps depth pixel-aligned
+                        # with the identically-letterboxed color frame below
+                        # (same source H,W and target H,W => identical geometry).
+                        depth = resize_with_pad(
+                            depth, h_out, w_out, interpolation=cv2.INTER_LANCZOS4
                         )
                     if name in self.depths:
                         self.update_depth(name, depth)
@@ -1315,8 +1350,12 @@ class RaidenPolicyServer(chiral.PolicyServer):
                         self._video_frame_buffers[name].append(color_bgr)
                 if self._resize is not None:
                     h_out, w_out = self._resize
-                    color_bgr = cv2.resize(
-                        color_bgr, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
+                    # Letterbox (uniform scale + zero-pad) instead of a plain
+                    # cv2.resize stretch — preserves aspect ratio so the image
+                    # geometry matches what resize_with_pad() produces at
+                    # training time (see raiden/image_utils.py).
+                    color_bgr = resize_with_pad(
+                        color_bgr, h_out, w_out, interpolation=cv2.INTER_LANCZOS4
                     )
                 self.update_image(name, color_bgr[..., ::-1].copy())
                 with self._cam_ts_locks[name]:
@@ -1361,12 +1400,16 @@ class RaidenPolicyServer(chiral.PolicyServer):
                         self._video_frame_buffers[name].append(color_bgr)
                 if self._resize is not None:
                     h_out, w_out = self._resize
-                    color_bgr = cv2.resize(
-                        color_bgr, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
+                    # Letterbox (uniform scale + zero-pad), not a stretch —
+                    # see raiden/image_utils.py. Depth is resized the same way
+                    # (same source/target H,W => identical geometry), keeping
+                    # color and depth pixel-aligned.
+                    color_bgr = resize_with_pad(
+                        color_bgr, h_out, w_out, interpolation=cv2.INTER_LANCZOS4
                     )
                     if depth is not None:
-                        depth = cv2.resize(
-                            depth, (w_out, h_out), interpolation=cv2.INTER_LANCZOS4
+                        depth = resize_with_pad(
+                            depth, h_out, w_out, interpolation=cv2.INTER_LANCZOS4
                         )
                 # Serve RGB to the policy.
                 self.update_image(name, color_bgr[..., ::-1].copy())

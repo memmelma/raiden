@@ -46,6 +46,7 @@ import numpy as np
 
 from raiden._config import CALIBRATION_FILE, CAMERA_CONFIG
 from raiden.camera_config import CameraConfig
+from raiden.camera_health import CameraHealthMonitor, check_cameras_at_startup
 from raiden.cameras import Camera
 from raiden.control import TeleopInterface
 from raiden.db.database import get_db
@@ -109,6 +110,12 @@ class DemonstrationRecorder:
         self.is_recording = False
         self._stop_event = threading.Event()
         self._threads: List[threading.Thread] = []
+        # Watches every camera for the duration of the episode so a stream
+        # that goes black/frozen mid-recording (not just at session start)
+        # produces a loud console warning instead of silently corrupting the
+        # episode. Shared across episodes; healthy/unhealthy state resets
+        # naturally as update() sees new frames each episode.
+        self._camera_health = CameraHealthMonitor()
 
         # Robot data accumulated during one episode
         self._robot_frames: List[Dict] = []
@@ -236,9 +243,28 @@ class DemonstrationRecorder:
     # ------------------------------------------------------------------
 
     def _camera_loop(self, camera: Camera, stop_event: threading.Event) -> None:
-        """Grab loop – camera SDK rate-limits to its own FPS (30 Hz)."""
+        """Grab loop – camera SDK rate-limits to its own FPS (30 Hz).
+
+        Every ~1s, sample the frame just grabbed and run it through
+        ``CameraHealthMonitor`` so a camera that dies mid-episode (USB
+        dropout, connector wiggled loose, etc.) prints a loud warning instead
+        of silently recording black frames for the rest of the episode.
+        """
+        health_check_every = 30  # ~1s at 30fps
+        n = 0
         while not stop_event.is_set():
-            camera.grab()
+            if not camera.grab():
+                continue
+            n += 1
+            if n % health_check_every == 0:
+                try:
+                    frame = camera.get_frame()
+                except Exception as e:
+                    print(f"[camera-health] '{camera.name}' get_frame() failed: {e}")
+                    continue
+                warning = self._camera_health.update(camera.name, frame.color)
+                if warning:
+                    print(warning)
 
     def _robot_loop(self, stop_event: threading.Event, ref_camera) -> None:
         """Read joint observations at ~100 Hz and buffer them.
@@ -417,7 +443,53 @@ def load_cameras_from_config(
         raise RuntimeError(f"Camera initialization failed: {errors}")
 
     # Return cameras in config order.
-    return [results[name] for name in names]
+    cameras = [results[name] for name in names]
+
+    # Fail fast if any camera opened successfully but is actually delivering
+    # a black/degenerate feed (lens cap left on, USB bandwidth starvation,
+    # wrong serial in camera.json, etc.) — better to abort here than to
+    # silently record an episode of black frames.
+    _check_cameras_health_at_open(cameras)
+
+    return cameras
+
+
+def _check_cameras_health_at_open(cameras: List[Camera]) -> None:
+    """Grab one frame from each just-opened camera and verify it isn't black.
+
+    Retries for a few seconds: after parallel multi-cam open on a shared USB
+    hub, the first wait_for_frames() often times out even though the pipeline
+    started successfully (especially the scene D435).
+    """
+    import time
+
+    images: Dict[str, np.ndarray] = {}
+    grab_errors: Dict[str, str] = {}
+    deadline = time.time() + 5.0
+    pending = {cam.name: cam for cam in cameras}
+
+    while pending and time.time() < deadline:
+        for name, cam in list(pending.items()):
+            try:
+                if not cam.grab():
+                    grab_errors[name] = "grab() returned False"
+                    continue
+                images[name] = cam.get_frame().color
+                pending.pop(name)
+                grab_errors.pop(name, None)
+            except Exception as exc:  # noqa: BLE001 - surface any SDK error clearly
+                grab_errors[name] = str(exc)
+        if pending:
+            time.sleep(0.1)
+
+    if pending:
+        # Keep last error per still-pending camera
+        raise RuntimeError(
+            f"Camera(s) failed to deliver a frame at open(): "
+            f"{ {n: grab_errors.get(n, 'grab() returned False') for n in pending} }"
+        )
+
+    check_cameras_at_startup(images, context="rd record startup")
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +597,10 @@ def _next_recording_dir(task_dir: Path) -> Path:
             last_dir.mkdir()
             return last_dir
 
-    episode_idx = f"{len(existing):04d}"
+    # Use max(id)+1, not len(existing). After deletions, numbering has gaps and
+    # len(existing) can collide with a kept directory (e.g. mkdir 0057 when 0057 exists).
+    next_idx = (max(int(d.name) for d in existing) + 1) if existing else 0
+    episode_idx = f"{next_idx:04d}"
     new_dir = task_dir / episode_idx
     new_dir.mkdir()
     return new_dir

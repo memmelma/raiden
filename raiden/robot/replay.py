@@ -22,6 +22,7 @@ Processed (``lowdim/<frame>.pkl``)
 import pickle
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -30,6 +31,13 @@ from i2rt.robots.kinematics import Kinematics
 
 from raiden._xml_paths import get_yam_4310_linear_xml_path
 from raiden.robot.controller import RobotController, smooth_move_joints
+from raiden.robot.replay_images import (
+    LiveCameraGrabber,
+    ProcessedFrameReader,
+    RawFrameReader,
+    list_recording_cameras,
+)
+from raiden.robot.rollout_logger import DOF, RolloutLogger
 
 
 def _noop_keep_mask(
@@ -292,6 +300,9 @@ def run_replay(
     noop_eps_joint: float = 1e-3,
     noop_eps_gripper: float = 1e-3,
     noop_min_frames: int = 10,
+    log_dir: Optional[str] = None,
+    log_images: bool = False,
+    image_log_hz: float = 2.0,
 ) -> None:
     """Replay a recorded episode.
 
@@ -314,6 +325,17 @@ def run_replay(
         noop_eps_joint: Max absolute joint delta (rad) to classify as a no-op.
         noop_eps_gripper: Max absolute gripper delta to classify as a no-op.
         noop_min_frames: Abort replay if fewer frames remain after filtering.
+        log_dir: Root directory for rollout debug logs (replayed trajectory vs.
+            actual robot state), in the same format ``rd infer`` uses — pass to
+            ``scripts/visualize_rollout.py`` to compare replay against
+            inference. Default: ``/home/reward/Projects/logs/``.
+        log_images: Also periodically log (1) a live snapshot from the real
+            robot's cameras and (2) the corresponding recorded frame from the
+            dataset being replayed, so you can visually compare them. Off by
+            default (opens real cameras + decodes the recording's video —
+            has a cost, so opt in only when actively debugging).
+        image_log_hz: How often to capture the live/dataset image pair, in Hz
+            (default 2.0). Independent of ``control_hz``.
     """
     if (recording_dir / "robot_data.npz").exists():
         _run_raw_replay(
@@ -327,6 +349,9 @@ def run_replay(
             noop_eps_joint=noop_eps_joint,
             noop_eps_gripper=noop_eps_gripper,
             noop_min_frames=noop_min_frames,
+            log_dir=log_dir,
+            log_images=log_images,
+            image_log_hz=image_log_hz,
         )
     elif (recording_dir / "lowdim").exists():
         _run_processed_replay(
@@ -341,6 +366,9 @@ def run_replay(
             noop_eps_joint=noop_eps_joint,
             noop_eps_gripper=noop_eps_gripper,
             noop_min_frames=noop_min_frames,
+            log_dir=log_dir,
+            log_images=log_images,
+            image_log_hz=image_log_hz,
         )
     else:
         raise FileNotFoundError(
@@ -359,6 +387,9 @@ def _run_raw_replay(
     noop_eps_joint: float = 1e-3,
     noop_eps_gripper: float = 1e-3,
     noop_min_frames: int = 10,
+    log_dir: Optional[str] = None,
+    log_images: bool = False,
+    image_log_hz: float = 2.0,
 ) -> None:
     """Replay directly from raw joint commands in robot_data.npz (no IK)."""
     joints_l, joints_r, timestamps = _load_raw_joints(recording_dir)
@@ -399,6 +430,17 @@ def _run_raw_replay(
     print(f"Arms      : {arms}")
     print(f"Speed     : {speed}x")
 
+    dataset_reader = None
+    if log_images:
+        camera_names = list_recording_cameras(recording_dir)
+        if camera_names:
+            dataset_reader = RawFrameReader(
+                recording_dir, camera_names, total_control_steps=n_frames
+            )
+        else:
+            print(f"[replay_images] no cameras found under {recording_dir}/cameras/ — "
+                  "dataset image logging disabled.")
+
     _stream_trajectories(
         traj_l,
         traj_r,
@@ -406,6 +448,11 @@ def _run_raw_replay(
         speed=speed,
         control_hz=control_hz,
         visualize=visualize,
+        recording_dir=recording_dir,
+        log_dir=log_dir,
+        log_images=log_images,
+        image_log_hz=image_log_hz,
+        dataset_reader=dataset_reader,
     )
 
 
@@ -421,6 +468,9 @@ def _run_processed_replay(
     noop_eps_joint: float = 1e-3,
     noop_eps_gripper: float = 1e-3,
     noop_min_frames: int = 10,
+    log_dir: Optional[str] = None,
+    log_images: bool = False,
+    image_log_hz: float = 2.0,
 ) -> None:
     """Replay from processed lowdim pkl files using IK from EE poses."""
     use_right = arms == "bimanual"
@@ -463,6 +513,18 @@ def _run_processed_replay(
     print(f"Arms      : {arms}")
     print(f"Speed     : {speed}x")
 
+    upsample = control_hz // effective_hz
+    dataset_reader = None
+    if log_images:
+        camera_names = list_recording_cameras(recording_dir)
+        if camera_names:
+            dataset_reader = ProcessedFrameReader(
+                recording_dir, camera_names, upsample=upsample, stride=stride
+            )
+        else:
+            print(f"[replay_images] no cameras found under {recording_dir}/rgb/ — "
+                  "dataset image logging disabled.")
+
     robot = RobotController(
         use_right_follower=use_right,
         use_left_follower=True,
@@ -498,6 +560,11 @@ def _run_processed_replay(
             control_hz=control_hz,
             robot=robot,
             visualize=visualize,
+            recording_dir=recording_dir,
+            log_dir=log_dir,
+            log_images=log_images,
+            image_log_hz=image_log_hz,
+            dataset_reader=dataset_reader,
         )
     except KeyboardInterrupt:
         print("\nReplay interrupted.")
@@ -515,11 +582,25 @@ def _stream_trajectories(
     recording_dir: Optional[Path] = None,
     robot: Optional["RobotController"] = None,
     visualize: bool = False,
+    log_dir: Optional[str] = None,
+    log_images: bool = False,
+    image_log_hz: float = 2.0,
+    dataset_reader: Optional[object] = None,
 ) -> None:
     """Connect to (or reuse) the robot, move to start, then stream joint trajectories.
 
     If *robot* is None a new ``RobotController`` is created and closed when
     done.  Pass an already-initialized controller to avoid reconnecting.
+
+    Logs the replayed (commanded) trajectory alongside the actual robot state
+    to ``log_dir`` (default ``/home/reward/Projects/logs/``) in the same
+    format ``rd infer`` uses, so ``scripts/visualize_rollout.py`` can compare
+    a ground-truth replay against a live-policy rollout of the same task.
+
+    When ``log_images`` is set, also periodically saves (1) a live snapshot
+    from the real robot's cameras and (2) the matching recorded frame from
+    ``dataset_reader`` (a :class:`~raiden.robot.replay_images.ProcessedFrameReader`
+    or :class:`~raiden.robot.replay_images.RawFrameReader`), at ``image_log_hz``.
     """
     owns_robot = robot is None
     if owns_robot:
@@ -530,6 +611,30 @@ def _stream_trajectories(
             use_left_leader=False,
         )
         robot.initialize_robots()
+
+    run_name = "replay_" + (recording_dir.name if recording_dir else "unknown")
+    run_name += "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger_kwargs = {"log_root": Path(log_dir)} if log_dir else {}
+    rollout_logger = RolloutLogger(
+        run_name=run_name,
+        source="replay",
+        extra_meta={
+            # Resolve to absolute so offline backfill / viz can find bags
+            # even if the shell cwd differs from the original replay cwd.
+            "recording_dir": str(recording_dir.resolve()) if recording_dir else None,
+            "log_images_enabled": log_images,
+        },
+        **logger_kwargs,
+    )
+
+    live_grabber: Optional[LiveCameraGrabber] = None
+    image_log_every = max(1, round(control_hz / image_log_hz)) if image_log_hz > 0 else None
+    if log_images:
+        camera_names = list_recording_cameras(recording_dir) if recording_dir else []
+        if camera_names:
+            live_grabber = LiveCameraGrabber(camera_names)
+        else:
+            print("[replay_images] no recording cameras identified — live image logging disabled.")
 
     # ── Rerun setup ────────────────────────────────────────────────────────
     rr_kin = None
@@ -599,6 +704,49 @@ def _stream_trajectories(
             if use_right and robot.follower_r is not None and traj_r is not None:
                 robot.follower_r.command_joint_pos(traj_r[i])
 
+            # Log replayed (commanded) trajectory vs. actual robot state at
+            # ~30 Hz (same cadence as the Rerun stream) so debug logs stay a
+            # manageable size for long/fast (150 Hz) replays.
+            if i % log_every == 0:
+                right_cmd = (
+                    traj_r[i]
+                    if (use_right and traj_r is not None)
+                    else np.zeros(DOF, dtype=np.float32)
+                )
+                left_cmd = traj_l[i]
+                action_14d = np.concatenate([right_cmd, left_cmd]).astype(np.float32)
+
+                right_state = (
+                    robot.follower_r.get_joint_pos().astype(np.float32)
+                    if (use_right and robot.follower_r is not None)
+                    else np.zeros(DOF, dtype=np.float32)
+                )
+                left_state = (
+                    robot.follower_l.get_joint_pos().astype(np.float32)
+                    if robot.follower_l is not None
+                    else np.zeros(DOF, dtype=np.float32)
+                )
+                state_14d = np.concatenate([right_state, left_state])
+
+                # No safety-clip step during replay, so predicted == commanded.
+                rollout_logger.log_step(
+                    state_14d=state_14d,
+                    action_pred_14d=action_14d,
+                    action_cmd_14d=action_14d,
+                )
+
+            # Periodically log a live robot snapshot + the matching recorded
+            # dataset frame, at image_log_hz (independent of log_every above).
+            if log_images and image_log_every is not None and i % image_log_every == 0:
+                if live_grabber is not None:
+                    live_images = live_grabber.grab_all()
+                    if live_images:
+                        rollout_logger.log_images(i, live_images, group="live")
+                if dataset_reader is not None:
+                    dataset_images = dataset_reader.get_frame(i)
+                    if dataset_images:
+                        rollout_logger.log_images(i, dataset_images, group="dataset")
+
             if visualize and rr_kin is not None and i % log_every == 0:
                 import rerun as rr
 
@@ -649,6 +797,11 @@ def _stream_trajectories(
     except KeyboardInterrupt:
         print("\nReplay interrupted.")
     finally:
+        rollout_logger.save()
+        if live_grabber is not None:
+            live_grabber.close()
+        if dataset_reader is not None:
+            dataset_reader.close()
         if owns_robot:
             robot.move_to_home_positions()
             robot.close()
